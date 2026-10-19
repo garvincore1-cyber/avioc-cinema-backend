@@ -1,0 +1,17 @@
+{
+  "name": "avioc-cinema-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Avioc Cinema account, subscription, and LivePay API for Render",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "mongodb": "^6.20.0"
+  }
+}
