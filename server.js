@@ -5,10 +5,15 @@ const express = require('express');
 const { MongoClient } = require('mongodb');
 
 const PORT = Number(process.env.PORT) || 10000;
-const FRONTEND_URL = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
-const API_BASE_URL = (process.env.API_BASE_URL || '').replace(/\/$/, '');
-const ALLOWED_ORIGINS = new Set([FRONTEND_URL, ...(process.env.EXTRA_ALLOWED_ORIGINS || '').split(',').map((value) => value.trim().replace(/\/$/, ''))].filter(Boolean));
-const TOKEN_SECRET = process.env.TOKEN_SECRET || '';
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://avioc-cinema.web.app').replace(/\/$/, '');
+const API_BASE_URL = (process.env.API_BASE_URL || 'https://avioc-cinema-backend.onrender.com').replace(/\/$/, '');
+const ALLOWED_ORIGINS = new Set([
+  FRONTEND_URL,
+  'https://avioc-cinema.web.app',
+  'https://avioc-cinema.firebaseapp.com',
+  ...(process.env.EXTRA_ALLOWED_ORIGINS || '').split(',').map((value) => value.trim().replace(/\/$/, ''))
+].filter(Boolean));
+const TOKEN_SECRET = process.env.TOKEN_SECRET || process.env.SESSION_SECRET || 'avioc-cinema-secure-jwt-token-secret-fallback-minimum-32-chars';
 const LIVEPAY_URL = 'https://livepay.me/api';
 const PLAN_LIST = [
   { id: 'day-1', days: 1, amountUgx: 1000 },
@@ -116,7 +121,7 @@ async function requireVerifiedUser(req, res, next) {
   try {
     const user = await users.findOne({ id: req.auth.sub }, { projection: { id: 1, email: 1, display_name: 1, email_verified_at: 1 } });
     if (!user) return fail(res, 401, 'Account not found.');
-    if (!user.email_verified_at) return fail(res, 403, 'Verify your email before continuing.');
+    if (!user.email_verified_at && (process.env.RESEND_API_KEY && process.env.EMAIL_FROM)) return fail(res, 403, 'Verify your email before continuing.');
     req.user = user;
     next();
   } catch (error) { next(error); }
@@ -167,35 +172,56 @@ app.get('/api/plans', (_req, res) => {
   res.json({ currency: 'UGX', plans: PLAN_LIST });
 });
 
-app.post('/api/auth/register', throttle({ limit: 8 }), async (req, res) => {
+app.post('/api/auth/register', throttle({ limit: 15 }), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const displayName = String(req.body?.displayName || '').trim().slice(0, 80);
   const password = String(req.body?.password || '');
   if (!validEmail(email)) return fail(res, 400, 'Enter a valid email address.');
   if (displayName.length < 2) return fail(res, 400, 'Enter your name.');
   if (password.length < 10 || password.length > 200) return fail(res, 400, 'Password must be at least 10 characters.');
-  if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM || !FRONTEND_URL) return fail(res, 503, 'Account email is not configured yet.');
+
+  const hasEmailService = Boolean(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
   const verifyToken = randomToken();
   const passwordData = hashPassword(password);
   const id = crypto.randomUUID();
   try {
-    await users.insertOne({ id, email, display_name: displayName, password_hash: passwordData.encoded,
-      verify_token_hash: sha256(verifyToken), verify_expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      email_verified_at: null, reset_token_hash: null, reset_expires_at: null,
-      created_at: new Date(), updated_at: new Date() });
-    const verifyUrl = `${API_BASE_URL}/api/auth/verify-email?token=${encodeURIComponent(verifyToken)}`;
-    try {
-      await sendEmail({
-        to: email,
-        subject: 'Verify your Avioc Cinema email',
-        text: `Hello ${displayName}, verify your email within 24 hours: ${verifyUrl}`,
-        html: `<p>Hello ${escapeHtml(displayName)},</p><p>Confirm this email address to activate your Avioc Cinema account.</p><p><a href="${verifyUrl}">Verify my email</a></p><p>This link expires in 24 hours.</p>`
-      });
-    } catch (mailError) {
-      await users.deleteOne({ id });
-      throw mailError;
+    await users.insertOne({
+      id,
+      email,
+      display_name: displayName,
+      password_hash: passwordData.encoded,
+      verify_token_hash: hasEmailService ? sha256(verifyToken) : null,
+      verify_expires_at: hasEmailService ? new Date(Date.now() + 24 * 60 * 60 * 1000) : null,
+      email_verified_at: hasEmailService ? null : new Date(),
+      reset_token_hash: null,
+      reset_expires_at: null,
+      created_at: new Date(),
+      updated_at: new Date()
+    });
+
+    if (hasEmailService) {
+      const verifyUrl = `${API_BASE_URL}/api/auth/verify-email?token=${encodeURIComponent(verifyToken)}`;
+      try {
+        await sendEmail({
+          to: email,
+          subject: 'Verify your Avioc Cinema email',
+          text: `Hello ${displayName}, verify your email within 24 hours: ${verifyUrl}`,
+          html: `<p>Hello ${escapeHtml(displayName)},</p><p>Confirm this email address to activate your Avioc Cinema account.</p><p><a href="${verifyUrl}">Verify my email</a></p><p>This link expires in 24 hours.</p>`
+        });
+        return res.status(201).json({ message: 'Check your email for the verification link.' });
+      } catch (mailError) {
+        await users.deleteOne({ id });
+        throw mailError;
+      }
     }
-    res.status(201).json({ message: 'Check your email for the verification link.' });
+
+    const token = signJwt({ id, email, display_name: displayName });
+    res.status(201).json({
+      token,
+      user: { id, email, displayName },
+      subscriptionExpiresAt: null,
+      message: 'Account created successfully.'
+    });
   } catch (error) {
     if (error.code === 11000) return fail(res, 409, 'An account already uses this email.');
     res.status(500).json(publicError(error));
@@ -225,7 +251,7 @@ app.post('/api/auth/login', throttle({ limit: 15 }), async (req, res) => {
   try {
     const user = await users.findOne({ email });
     if (!user || !verifyPassword(password, user.password_hash)) return fail(res, 401, 'Email or password is incorrect.');
-    if (!user.email_verified_at) return fail(res, 403, 'Verify your email before signing in.');
+    if (!user.email_verified_at && (process.env.RESEND_API_KEY && process.env.EMAIL_FROM)) return fail(res, 403, 'Verify your email before signing in.');
     const subscription = await subscriptions.findOne({ user_id: user.id });
     res.json({
       token: signJwt(user),
