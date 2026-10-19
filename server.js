@@ -348,18 +348,19 @@ app.get('/api/me', userOnly, async (req, res) => {
     let isActive = Boolean(expiry && new Date(expiry) > new Date());
 
     if (!isActive) {
-      const recentPayments = await payments.find({ user_id: req.user.id, status: 'pending' }).sort({ created_at: -1 }).limit(3).toArray();
+      const recentPayments = await payments.find({ user_id: req.user.id, status: { $ne: 'success' } }).sort({ created_at: -1 }).limit(5).toArray();
       for (const p of recentPayments) {
         try {
           const check = await confirmAtLivePay(p.reference, p.currency);
           console.log(`LivePay status check for ${p.reference}:`, check);
-          if (String(check.status || '').toLowerCase() === 'success') {
+          const s = String(check?.status || '').toLowerCase();
+          if (s === 'success' || s === 'successful' || s === 'completed') {
             await activatePaymentSuccess(p, check);
             subscription = await subscriptions.findOne({ user_id: req.user.id });
             expiry = subscription?.expires_at || null;
             isActive = true;
             break;
-          } else if (['failed', 'failure', 'cancelled', 'canceled', 'expired'].includes(String(check.status || '').toLowerCase())) {
+          } else if (['failed', 'failure', 'cancelled', 'canceled', 'expired'].includes(s)) {
             await payments.updateOne({ id: p.id }, { $set: { status: 'failed', provider_message: check.message || check.status } });
           }
         } catch (err) {
