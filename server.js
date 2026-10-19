@@ -323,7 +323,9 @@ app.post('/api/payments', userOnly, throttle({ limit: 10 }), async (req, res) =>
   const method = String(req.body?.method || '');
   if (!plan) return fail(res, 400, 'Choose a valid subscription plan.');
   if (!['mobile_money', 'card'].includes(method)) return fail(res, 400, 'Choose mobile money or card.');
-  if (!process.env.LIVEPAY_API_KEY || !process.env.LIVEPAY_ACCOUNT_NUMBER) return fail(res, 503, 'Payment service is not configured yet.');
+  const livepayKey = (process.env.LIVEPAY_API_KEY || '').trim();
+  const livepayAccount = (process.env.LIVEPAY_ACCOUNT_NUMBER || '').trim();
+  if (!livepayKey || !livepayAccount) return fail(res, 503, 'Payment service is not configured yet.');
 
   let amount = plan.amountUgx;
   let currency = 'UGX';
@@ -334,11 +336,11 @@ app.post('/api/payments', userOnly, throttle({ limit: 10 }), async (req, res) =>
   let livepayBody;
 
   if (method === 'mobile_money') {
-    phoneNumber = String(req.body?.phoneNumber || '').replace(/[\s()-]/g, '');
+    phoneNumber = String(req.body?.phoneNumber || '').trim().replace(/[\s()-]/g, '');
     network = String(req.body?.network || '').toUpperCase();
     if (!/^\+?[0-9]{9,15}$/.test(phoneNumber)) return fail(res, 400, 'Enter a valid mobile money phone number.');
     if (!['MTN', 'AIRTEL'].includes(network)) return fail(res, 400, 'Choose MTN or Airtel.');
-    livepayBody = { accountNumber: process.env.LIVEPAY_ACCOUNT_NUMBER, phoneNumber, amount, currency, reference: '', description: `Avioc Cinema ${plan.days}-day pass` };
+    livepayBody = { accountNumber: livepayAccount, phoneNumber, amount, currency, reference: '', description: `Avioc Cinema ${plan.days}-day pass` };
   } else {
     const name = String(req.body?.name || req.user.display_name).trim().slice(0, 100);
     const cardPrice = CARD_PRICES_USD[plan.id];
@@ -348,7 +350,7 @@ app.post('/api/payments', userOnly, throttle({ limit: 10 }), async (req, res) =>
     exchangeRate = null;
     if (amount < 1) return fail(res, 400, 'LivePay card checkout has a USD 1.00 minimum. Choose a longer pass or use MTN/Airtel mobile money.');
     livepayPath = '/card-collection';
-    livepayBody = { accountNumber: process.env.LIVEPAY_ACCOUNT_NUMBER, amount, currency, reference: '', email: req.user.email, name, description: `Avioc Cinema ${plan.days}-day pass`, return_url: `${FRONTEND_URL}/?payment=pending` };
+    livepayBody = { accountNumber: livepayAccount, amount, currency, reference: '', email: req.user.email, name, description: `Avioc Cinema ${plan.days}-day pass`, return_url: `${FRONTEND_URL}/?payment=pending` };
   }
 
   const reference = newReference();
@@ -367,14 +369,16 @@ app.post('/api/payments', userOnly, throttle({ limit: 10 }), async (req, res) =>
   try {
     const providerResponse = await fetch(`${LIVEPAY_URL}${livepayPath}`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${process.env.LIVEPAY_API_KEY}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${livepayKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(livepayBody),
       signal: AbortSignal.timeout(20000)
     });
     const data = await providerResponse.json().catch(() => ({}));
+    console.log('LivePay API status:', providerResponse.status, 'body:', JSON.stringify(data), 'sent:', JSON.stringify(livepayBody));
     if (!providerResponse.ok || data.success !== true) {
-      await payments.updateOne({ id: paymentId }, { $set: { status: 'failed', provider_message: String(data.error || data.message || `LivePay returned ${providerResponse.status}`).slice(0, 500) } });
-      return fail(res, 502, 'LivePay could not start this payment. Please try again.');
+      const errorMsg = data.message || data.error || `LivePay returned HTTP ${providerResponse.status}`;
+      await payments.updateOne({ id: paymentId }, { $set: { status: 'failed', provider_message: String(errorMsg).slice(0, 500) } });
+      return fail(res, 502, errorMsg);
     }
     const checkoutUrl = method === 'card' ? livepayCheckoutUrl(data.checkout_url) : null;
     if (method === 'card' && !checkoutUrl) {
@@ -396,9 +400,27 @@ app.post('/api/payments', userOnly, throttle({ limit: 10 }), async (req, res) =>
       message: method === 'card' ? 'Continue to LivePay to complete your card payment.' : 'Approve the payment prompt on your phone.'
     });
   } catch (error) {
+    console.error('LivePay fetch error:', error);
     await payments.updateOne({ id: paymentId, status: 'pending' }, { $set: { status: 'failed', provider_message: String(error.message || 'LivePay request failed').slice(0, 500) } }).catch(() => {});
-    res.status(502).json(publicError(error));
+    res.status(502).json({ error: error.message || 'LivePay could not be reached. Please try again.' });
   }
+});
+
+app.get('/api/payments/last-status', userOnly, async (req, res) => {
+  try {
+    const payment = await payments.findOne({ user_id: req.user.id }, { sort: { created_at: -1 } });
+    if (!payment) return fail(res, 404, 'No payments recorded.');
+    res.json({
+      status: payment.status,
+      providerMessage: payment.provider_message,
+      reference: payment.reference,
+      amount: payment.amount,
+      currency: payment.currency,
+      phoneNumber: payment.phone_number,
+      network: payment.network,
+      createdAt: payment.created_at
+    });
+  } catch (error) { res.status(500).json(publicError(error)); }
 });
 
 function livepayCheckoutUrl(value) {
