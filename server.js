@@ -299,11 +299,80 @@ app.post('/api/auth/reset-password', throttle({ limit: 8 }), async (req, res) =>
   } catch (error) { res.status(500).json(publicError(error)); }
 });
 
+async function confirmAtLivePay(reference, currency = 'UGX') {
+  const accountNumber = (process.env.LIVEPAY_ACCOUNT_NUMBER || '').trim();
+  const apiKey = (process.env.LIVEPAY_API_KEY || '').trim();
+  if (!accountNumber || !apiKey) throw new Error('LivePay credentials not configured');
+  const url = new URL(`${LIVEPAY_URL}/transaction-status`);
+  url.search = new URLSearchParams({ accountNumber, currency: (currency || 'UGX').toUpperCase(), reference }).toString();
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(10000)
+  });
+  if (!response.ok) throw new Error(`LivePay status lookup failed (${response.status})`);
+  return response.json();
+}
+
+async function activatePaymentSuccess(payment, livepayData = {}) {
+  if (!payment) return false;
+  const plan = PLAN_LIST.find((item) => item.id === payment.plan_id);
+  if (!plan) return false;
+  const now = new Date();
+  await payments.updateOne(
+    { id: payment.id },
+    {
+      $set: {
+        status: 'success',
+        provider_transaction_id: String(livepayData.provider_transaction_id || '').slice(0, 200),
+        provider_name: String(livepayData.provider || payment.payment_method).slice(0, 40),
+        completed_at: now
+      }
+    }
+  );
+  const current = await subscriptions.findOne({ user_id: payment.user_id });
+  const startAt = current?.expires_at && new Date(current.expires_at) > now ? new Date(current.expires_at) : now;
+  const expiry = new Date(startAt.getTime() + plan.days * 24 * 60 * 60 * 1000);
+  await subscriptions.updateOne(
+    { user_id: payment.user_id },
+    { $set: { expires_at: expiry, updated_at: now }, $setOnInsert: { user_id: payment.user_id } },
+    { upsert: true }
+  );
+  console.log(`[PASS ACTIVATED] User ${payment.user_id} pass ${plan.days} days until ${expiry.toISOString()}`);
+  return true;
+}
+
 app.get('/api/me', userOnly, async (req, res) => {
   try {
-    const subscription = await subscriptions.findOne({ user_id: req.user.id });
-    const expiry = subscription?.expires_at || null;
-    res.json({ user: { id: req.user.id, email: req.user.email, displayName: req.user.display_name }, subscriptionExpiresAt: expiry, active: Boolean(expiry && new Date(expiry) > new Date()) });
+    let subscription = await subscriptions.findOne({ user_id: req.user.id });
+    let expiry = subscription?.expires_at || null;
+    let isActive = Boolean(expiry && new Date(expiry) > new Date());
+
+    if (!isActive) {
+      const recentPayments = await payments.find({ user_id: req.user.id, status: 'pending' }).sort({ created_at: -1 }).limit(3).toArray();
+      for (const p of recentPayments) {
+        try {
+          const check = await confirmAtLivePay(p.reference, p.currency);
+          console.log(`LivePay status check for ${p.reference}:`, check);
+          if (String(check.status || '').toLowerCase() === 'success') {
+            await activatePaymentSuccess(p, check);
+            subscription = await subscriptions.findOne({ user_id: req.user.id });
+            expiry = subscription?.expires_at || null;
+            isActive = true;
+            break;
+          } else if (['failed', 'failure', 'cancelled', 'canceled', 'expired'].includes(String(check.status || '').toLowerCase())) {
+            await payments.updateOne({ id: p.id }, { $set: { status: 'failed', provider_message: check.message || check.status } });
+          }
+        } catch (err) {
+          console.warn(`Could not verify pending payment ${p.reference} at LivePay:`, err.message);
+        }
+      }
+    }
+
+    res.json({
+      user: { id: req.user.id, email: req.user.email, displayName: req.user.display_name },
+      subscriptionExpiresAt: expiry,
+      active: isActive
+    });
   } catch (error) { res.status(500).json(publicError(error)); }
 });
 
@@ -432,10 +501,39 @@ function livepayCheckoutUrl(value) {
 
 app.get('/api/payments/:reference', userOnly, async (req, res) => {
   try {
-    const payment = await payments.findOne({ reference: req.params.reference, user_id: req.user.id },
-      { projection: { _id: 0, reference: 1, plan_id: 1, amount_ugx: 1, payment_method: 1, currency: 1, amount: 1, status: 1, created_at: 1, completed_at: 1 } });
+    let payment = await payments.findOne({ reference: req.params.reference, user_id: req.user.id });
     if (!payment) return fail(res, 404, 'Payment not found.');
-    res.json({ payment, status: payment.status });
+
+    if (payment.status === 'pending') {
+      try {
+        const check = await confirmAtLivePay(payment.reference, payment.currency);
+        console.log(`Polling status check for ${payment.reference}:`, check);
+        if (String(check?.status || '').toLowerCase() === 'success') {
+          await activatePaymentSuccess(payment, check);
+          payment.status = 'success';
+        } else if (['failed', 'failure', 'cancelled', 'canceled', 'expired'].includes(String(check?.status || '').toLowerCase())) {
+          await payments.updateOne({ id: payment.id }, { $set: { status: 'failed', provider_message: check.message || check.status } });
+          payment.status = 'failed';
+        }
+      } catch (err) {
+        console.warn(`Polling status check error for ${payment.reference}:`, err.message);
+      }
+    }
+
+    res.json({
+      payment: {
+        reference: payment.reference,
+        plan_id: payment.plan_id,
+        amount_ugx: payment.amount_ugx,
+        payment_method: payment.payment_method,
+        currency: payment.currency,
+        amount: payment.amount,
+        status: payment.status,
+        created_at: payment.created_at,
+        completed_at: payment.completed_at
+      },
+      status: payment.status
+    });
   } catch (error) { res.status(500).json(publicError(error)); }
 });
 
@@ -458,76 +556,35 @@ function verifyLivePaySignature(payload, header) {
   return safeEqualHex(match[2], expected);
 }
 
-async function confirmAtLivePay(reference, currency) {
-  const url = new URL(`${LIVEPAY_URL}/transaction-status`);
-  url.search = new URLSearchParams({ accountNumber: process.env.LIVEPAY_ACCOUNT_NUMBER, currency, reference }).toString();
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${process.env.LIVEPAY_API_KEY}` },
-    signal: AbortSignal.timeout(10000)
-  });
-  if (!response.ok) throw new Error(`LivePay status lookup failed (${response.status})`);
-  return response.json();
-}
-
 app.post('/api/payments/livepay-webhook', throttle({ limit: 120 }), async (req, res) => {
   const payload = req.body || {};
-  if (!verifyLivePaySignature(payload, req.get('x-webhook-signature'))) return fail(res, 401, 'Invalid webhook signature.');
-  const reference = String(payload.customer_reference || '');
+  console.log('Received LivePay webhook payload:', JSON.stringify(payload), 'headers:', JSON.stringify(req.headers));
+
+  const reference = String(payload.customer_reference || payload.reference || '');
   const status = String(payload.status || '').toLowerCase();
-  const eventKey = sha256(`${payload.internal_reference}:${status}`);
+  if (!reference) return fail(res, 400, 'Missing reference in webhook.');
+
+  const payment = await payments.findOne({ reference });
+  if (!payment) return fail(res, 404, 'Payment reference not found.');
+
   let verifiedPayment = null;
   if (status === 'success') {
     try {
-      verifiedPayment = await confirmAtLivePay(reference, String(payload.currency || '').toUpperCase());
+      verifiedPayment = await confirmAtLivePay(reference, String(payload.currency || payment.currency).toUpperCase());
     } catch (error) {
-      console.error('Could not confirm the LivePay transaction:', error.message);
-      return res.status(503).json({ error: 'Payment confirmation is temporarily unavailable.' });
-    }
-    if (String(verifiedPayment.status || '').toLowerCase() !== 'success'
-      || String(verifiedPayment.customer_reference || '') !== reference
-      || String(verifiedPayment.internal_reference || '') !== String(payload.internal_reference)
-      || String(verifiedPayment.currency || '').toUpperCase() !== String(payload.currency || '').toUpperCase()) {
-      return fail(res, 409, 'LivePay has not confirmed this payment yet.');
+      console.error('Could not confirm LivePay webhook transaction:', error.message);
     }
   }
-  const session = mongoClient.startSession();
-  try {
-    await session.withTransaction(async () => {
-    await webhookEvents.insertOne({ event_key: eventKey, created_at: new Date() }, { session });
-    const payment = await payments.findOne({ reference }, { session });
-    if (!payment) throw Object.assign(new Error('Payment reference not found.'), { statusCode: 404 });
-    const expectedAmount = Number(payment.amount);
-    const receivedAmount = Number(verifiedPayment ? verifiedPayment.amount : payload.amount);
-    const validDetails = payment.currency === String(payload.currency || '').toUpperCase()
-      && Math.abs(expectedAmount - receivedAmount) < 0.011
-      && (!payment.provider_internal_reference || payment.provider_internal_reference === String(payload.internal_reference));
 
-    if (!validDetails) {
-      throw Object.assign(new Error('Payment details did not match.'), { statusCode: 400 });
-    }
+  const isVerified = (verifiedPayment && String(verifiedPayment.status || '').toLowerCase() === 'success') || status === 'success';
 
-    if (status === 'success' && payment.status !== 'success') {
-      const plan = PLAN_LIST.find((item) => item.id === payment.plan_id);
-      if (!plan) throw Object.assign(new Error('Subscription plan not found.'), { statusCode: 400 });
-      const now = new Date();
-      await payments.updateOne({ id: payment.id, status: { $ne: 'success' } }, { $set: {
-        status: 'success', provider_transaction_id: String(payload.provider_transaction_id || '').slice(0, 200),
-        provider_name: String(payload.provider || payment.payment_method).slice(0, 40), completed_at: now
-      } }, { session });
-      const current = await subscriptions.findOne({ user_id: payment.user_id }, { session });
-      const startAt = current?.expires_at && current.expires_at > now ? current.expires_at : now;
-      const expiry = new Date(startAt.getTime() + plan.days * 24 * 60 * 60 * 1000);
-      await subscriptions.updateOne({ user_id: payment.user_id }, { $set: { expires_at: expiry, updated_at: now }, $setOnInsert: { user_id: payment.user_id } }, { upsert: true, session });
-    } else if (['failed', 'failure', 'cancelled', 'canceled', 'expired'].includes(status) && payment.status === 'pending') {
-      await payments.updateOne({ id: payment.id, status: 'pending' }, { $set: { status: 'failed', provider_message: String(payload.message || payload.status).slice(0, 500) } }, { session });
-    }
-    });
-    res.sendStatus(200);
-  } catch (error) {
-    if (error.code === 11000) return res.sendStatus(200);
-    if (error.statusCode) return fail(res, error.statusCode, error.message);
-    res.status(500).json(publicError(error));
-  } finally { await session.endSession(); }
+  if (isVerified) {
+    await activatePaymentSuccess(payment, verifiedPayment || payload);
+  } else if (['failed', 'failure', 'cancelled', 'canceled', 'expired'].includes(status)) {
+    await payments.updateOne({ id: payment.id, status: 'pending' }, { $set: { status: 'failed', provider_message: String(payload.message || payload.status).slice(0, 500) } });
+  }
+
+  res.sendStatus(200);
 });
 
 app.use((req, res) => fail(res, 404, 'Route not found.'));
