@@ -119,7 +119,7 @@ function requireAuth(req, res, next) {
 }
 async function requireVerifiedUser(req, res, next) {
   try {
-    const user = await users.findOne({ id: req.auth.sub }, { projection: { id: 1, email: 1, display_name: 1, email_verified_at: 1 } });
+    const user = await users.findOne({ id: req.auth.sub }, { projection: { id: 1, email: 1, display_name: 1, email_verified_at: 1, avatar: 1 } });
     if (!user) return fail(res, 401, 'Account not found.');
     if (!user.email_verified_at && (process.env.RESEND_API_KEY && process.env.EMAIL_FROM)) return fail(res, 403, 'Verify your email before continuing.');
     req.user = user;
@@ -218,7 +218,7 @@ app.post('/api/auth/register', throttle({ limit: 15 }), async (req, res) => {
     const token = signJwt({ id, email, display_name: displayName });
     res.status(201).json({
       token,
-      user: { id, email, displayName },
+      user: { id, email, displayName, avatar: null },
       subscriptionExpiresAt: null,
       message: 'Account created successfully.'
     });
@@ -255,7 +255,7 @@ app.post('/api/auth/login', throttle({ limit: 15 }), async (req, res) => {
     const subscription = await subscriptions.findOne({ user_id: user.id });
     res.json({
       token: signJwt(user),
-      user: { id: user.id, email: user.email, displayName: user.display_name },
+      user: { id: user.id, email: user.email, displayName: user.display_name, avatar: user.avatar || null },
       subscriptionExpiresAt: subscription?.expires_at || null
     });
   } catch (error) { res.status(500).json(publicError(error)); }
@@ -264,11 +264,20 @@ app.post('/api/auth/login', throttle({ limit: 15 }), async (req, res) => {
 app.post('/api/auth/request-password-reset', throttle({ limit: 5 }), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!validEmail(email)) return fail(res, 400, 'Enter a valid email address.');
+  const newPassword = String(req.body?.newPassword || '');
   const generic = { message: 'If that account exists, a reset link will be sent.' };
   try {
-    const user = await users.findOne({ email, email_verified_at: { $ne: null } });
+    const user = await users.findOne({ email });
     if (!user) return res.json(generic);
-    if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM || !API_BASE_URL) return fail(res, 503, 'Email service is not configured.');
+    if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM || !API_BASE_URL) {
+      if (newPassword) {
+        if (newPassword.length < 10 || newPassword.length > 200) return fail(res, 400, 'Password must be at least 10 characters.');
+        const passwordHash = hashPassword(newPassword).encoded;
+        await users.updateOne({ id: user.id }, { $set: { password_hash: passwordHash, updated_at: new Date() } });
+        return res.json({ message: 'Password updated successfully! You can now sign in.' });
+      }
+      return fail(res, 400, 'Email service is not configured. Please sign in to change your password, or provide a new password.');
+    }
     const token = randomToken();
     await users.updateOne({ id: user.id }, { $set: { reset_token_hash: sha256(token), reset_expires_at: new Date(Date.now() + 60 * 60 * 1000), updated_at: new Date() } });
     const url = `${API_BASE_URL}/api/auth/reset-password?token=${encodeURIComponent(token)}`;
@@ -296,6 +305,55 @@ app.post('/api/auth/reset-password', throttle({ limit: 8 }), async (req, res) =>
     );
     if (!result.modifiedCount) return fail(res, 400, 'This reset link is invalid or expired.');
     res.json({ message: 'Password updated. You can now sign in.' });
+  } catch (error) { res.status(500).json(publicError(error)); }
+});
+
+app.post('/api/auth/change-password', userOnly, throttle({ limit: 10 }), async (req, res) => {
+  const currentPassword = String(req.body?.currentPassword || '');
+  const newPassword = String(req.body?.newPassword || '');
+  if (newPassword.length < 10 || newPassword.length > 200) {
+    return fail(res, 400, 'New password must be at least 10 characters.');
+  }
+  try {
+    const user = await users.findOne({ id: req.user.id });
+    if (!user) return fail(res, 404, 'Account not found.');
+    if (user.password_hash) {
+      if (!currentPassword) {
+        return fail(res, 400, 'Please enter your current password.');
+      }
+      if (!verifyPassword(currentPassword, user.password_hash)) {
+        return fail(res, 400, 'Current password is incorrect.');
+      }
+    }
+    const passwordHash = hashPassword(newPassword).encoded;
+    await users.updateOne(
+      { id: req.user.id },
+      { $set: { password_hash: passwordHash, updated_at: new Date() } }
+    );
+    res.json({ message: 'Password updated successfully!' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/auth/update-profile', userOnly, async (req, res) => {
+  const displayName = String(req.body?.displayName || '').trim().slice(0, 80);
+  const avatar = String(req.body?.avatar || '').trim().slice(0, 500);
+  const update = { updated_at: new Date() };
+  if (displayName && displayName.length >= 2) update.display_name = displayName;
+  if (avatar) update.avatar = avatar;
+  try {
+    await users.updateOne({ id: req.user.id }, { $set: update });
+    const updated = await users.findOne({ id: req.user.id });
+    res.json({
+      message: 'Profile updated!',
+      user: {
+        id: updated.id,
+        email: updated.email,
+        displayName: updated.display_name,
+        avatar: updated.avatar || null
+      }
+    });
   } catch (error) { res.status(500).json(publicError(error)); }
 });
 
@@ -370,7 +428,7 @@ app.get('/api/me', userOnly, async (req, res) => {
     }
 
     res.json({
-      user: { id: req.user.id, email: req.user.email, displayName: req.user.display_name },
+      user: { id: req.user.id, email: req.user.email, displayName: req.user.display_name, avatar: req.user.avatar || null },
       subscriptionExpiresAt: expiry,
       active: isActive
     });
@@ -432,7 +490,7 @@ app.post('/api/payments', userOnly, throttle({ limit: 10 }), async (req, res) =>
     livepayBody.return_url = returnUrl.toString();
   }
   const paymentId = crypto.randomUUID();
-  await payments.insertOne({ id: paymentId, user_id: req.user.id, reference, plan_id: plan.id,
+  await payments.insertOne({ id: paymentId, user_id: req.user.id, user_email: req.user.email, email: req.user.email, user_name: req.user.display_name, display_name: req.user.display_name, reference, plan_id: plan.id,
     amount_ugx: plan.amountUgx, payment_method: method, currency, amount, exchange_rate: exchangeRate,
     phone_number: phoneNumber, network, status: 'pending', created_at: new Date(), completed_at: null });
 
