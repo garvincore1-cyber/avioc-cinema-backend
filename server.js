@@ -36,7 +36,7 @@ app.use((req, res, next) => {
   res.set('Cache-Control', 'no-store');
   res.set('X-Content-Type-Options', 'nosniff');
   res.set('Referrer-Policy', 'no-referrer');
-  if (req.headers.origin && ALLOWED_ORIGINS.has(req.headers.origin.replace(/\/$/, ''))) {
+  if (req.headers.origin && (ALLOWED_ORIGINS.size === 0 || ALLOWED_ORIGINS.has('*') || ALLOWED_ORIGINS.has(req.headers.origin.replace(/\/$/, '')))) {
     res.set('Access-Control-Allow-Origin', req.headers.origin);
     res.set('Vary', 'Origin');
     res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
