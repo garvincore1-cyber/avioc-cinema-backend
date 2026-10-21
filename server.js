@@ -439,6 +439,78 @@ app.post('/api/auth/login', throttle({ limit: 15 }), async (req, res) => {
   } catch (error) { res.status(500).json(publicError(error)); }
 });
 
+app.post('/api/auth/google', throttle({ limit: 30 }), async (req, res) => {
+  try {
+    const credential = req.body?.credential || req.body?.idToken;
+    let email = normalizeEmail(req.body?.email);
+    let name = String(req.body?.displayName || req.body?.name || '').trim();
+    let avatar = String(req.body?.avatar || req.body?.picture || '').trim();
+
+    // If Google credential JWT is provided, decode payload
+    if (credential && typeof credential === 'string') {
+      try {
+        const parts = credential.split('.');
+        if (parts.length === 3) {
+          const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+          if (payload.email) email = normalizeEmail(payload.email);
+          if (payload.name && !name) name = String(payload.name).trim();
+          if (payload.picture && !avatar) avatar = String(payload.picture).trim();
+        }
+      } catch (e) {
+        console.warn('Failed to parse Google JWT payload:', e);
+      }
+    }
+
+    if (!email || !validEmail(email)) {
+      return fail(res, 400, 'Valid Google account email is required.');
+    }
+
+    if (!name) name = email.split('@')[0];
+
+    const now = new Date();
+    let user = await users.findOne({ email });
+
+    if (!user) {
+      const id = crypto.randomUUID();
+      user = {
+        id,
+        email,
+        display_name: name,
+        avatar: avatar || null,
+        provider: 'google',
+        password_hash: null,
+        email_verified_at: now,
+        created_at: now,
+        updated_at: now,
+        last_login_at: now
+      };
+      await users.insertOne(user);
+    } else {
+      const updateDoc = { last_login_at: now, updated_at: now };
+      if (!user.avatar && avatar) updateDoc.avatar = avatar;
+      if (!user.email_verified_at) updateDoc.email_verified_at = now;
+      await users.updateOne({ id: user.id }, { $set: updateDoc });
+      if (avatar && !user.avatar) user.avatar = avatar;
+    }
+
+    const subscription = await subscriptions.findOne({ user_id: user.id });
+    trackRequestVisitor(req, 'Signed In with Google', user);
+
+    res.json({
+      token: signJwt(user),
+      user: {
+        id: user.id,
+        email: user.email,
+        displayName: user.display_name,
+        avatar: user.avatar || null
+      },
+      subscriptionExpiresAt: subscription?.expires_at || null
+    });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
 app.post('/api/auth/request-password-reset', throttle({ limit: 5 }), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!validEmail(email)) return fail(res, 400, 'Enter a valid email address.');
