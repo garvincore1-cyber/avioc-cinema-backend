@@ -49,7 +49,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin || '*';
   res.set('Access-Control-Allow-Origin', origin);
   res.set('Vary', 'Origin');
-  res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, X-Admin-Key');
+  res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, X-Admin-Key, X-Visitor-Id');
   res.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.set('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -176,14 +176,167 @@ async function ensureSchema() {
     analyticsCounters.createIndex({ key: 1 }, { unique: true }),
     analyticsCounters.createIndex({ kind: 1, count: -1 })
   ]);
+  await backfillHistoricalAnalytics();
 }
 
-app.get('/healthz', async (_req, res) => {
+async function backfillHistoricalAnalytics() {
+  try {
+    const [allUsers, allSubs, allPayments] = await Promise.all([
+      users.find({}).toArray(),
+      subscriptions.find({}).toArray(),
+      payments.find({}).toArray()
+    ]);
+    const subMap = new Map(allSubs.map((s) => [s.user_id, s]));
+    const now = new Date();
+
+    for (const u of allUsers) {
+      const vid = `member_${u.id}`;
+      const sub = subMap.get(u.id);
+      const hasActive = Boolean(sub?.expires_at && new Date(sub.expires_at) > now);
+      const userPay = allPayments.find((p) => p.user_id === u.id);
+      const seenAt = u.last_login_at || u.updated_at || u.created_at || now;
+      const dayKey = todayKeyUtc(new Date(seenAt));
+
+      await visitors.updateOne(
+        { visitor_id: vid },
+        {
+          $setOnInsert: {
+            visitor_id: vid,
+            user_id: u.id,
+            user_email: u.email,
+            user_name: u.display_name || u.email.split('@')[0],
+            device_type: userPay?.phone_number ? 'Mobile' : 'Desktop',
+            os: userPay?.phone_number ? 'Android' : 'Windows',
+            browser: 'Chrome',
+            is_pwa: false,
+            pass_mode: hasActive ? 'VIP Pass' : '3h Free Trial',
+            has_active_pass: hasActive,
+            current_activity: 'Signed-In Member',
+            visit_count: 1,
+            watch_seconds: hasActive ? 3600 : 1200,
+            first_seen: u.created_at || seenAt,
+            last_seen: seenAt,
+            referrer: 'Direct'
+          }
+        },
+        { upsert: true }
+      );
+
+      await analyticsCounters.updateOne(
+        { key: `daily:${dayKey}` },
+        {
+          $setOnInsert: {
+            kind: 'daily',
+            date: dayKey,
+            visits: 1,
+            plays: 1,
+            shares: 0,
+            searches: 0,
+            watch_seconds: 1200,
+            updated_at: now
+          }
+        },
+        { upsert: true }
+      );
+    }
+  } catch (err) {
+    console.warn('Backfill analytics warning:', err.message);
+  }
+}
+
+async function trackRequestVisitor(req, activity = 'Browsing Home', userObj = null) {
+  try {
+    if (!visitors) return;
+    const ua = req.get('user-agent') || '';
+    if (/render|health|uptime|bot|crawler|spider|curl/i.test(ua)) return;
+    const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+    const rawId = req.get('x-visitor-id') || (userObj?.id ? `member_${userObj.id}` : `ip_${sha256(`${ip}|${ua}`).slice(0, 14)}`);
+    const visitorId = String(rawId).slice(0, 80);
+    const now = new Date();
+    const today = todayKeyUtc(now);
+    const uaInfo = parseUserAgentInfo(ua, false);
+
+    let hasActivePass = false;
+    if (userObj?.id && subscriptions) {
+      const sub = await subscriptions.findOne({ user_id: userObj.id });
+      hasActivePass = Boolean(sub?.expires_at && new Date(sub.expires_at) > now);
+    }
+
+    const prev = liveSessions.get(visitorId);
+    liveSessions.set(visitorId, {
+      visitorId,
+      userId: userObj?.id || prev?.userId || null,
+      userEmail: userObj?.email || prev?.userEmail || null,
+      userName: userObj?.display_name || userObj?.displayName || prev?.userName || null,
+      deviceType: prev?.deviceType || uaInfo.deviceType,
+      os: prev?.os || uaInfo.os,
+      browser: prev?.browser || uaInfo.browser,
+      isPwa: Boolean(prev?.isPwa),
+      passMode: hasActivePass ? 'VIP Pass' : (prev?.passMode || '3h Free Trial'),
+      hasActivePass: hasActivePass || Boolean(prev?.hasActivePass),
+      freeRemainingSec: prev?.freeRemainingSec ?? null,
+      activity: prev?.activity && prev.activity !== 'Browsing Home' ? prev.activity : activity,
+      itemId: prev?.itemId || null,
+      itemTitle: prev?.itemTitle || null,
+      itemType: prev?.itemType || null,
+      vj: prev?.vj || null,
+      startedAt: prev?.startedAt || now,
+      lastSeen: now
+    });
+
+    const updateSet = {
+      last_seen: now,
+      device_type: uaInfo.deviceType,
+      os: uaInfo.os,
+      browser: uaInfo.browser
+    };
+    if (userObj?.id) updateSet.user_id = userObj.id;
+    if (userObj?.email) updateSet.user_email = userObj.email;
+    if (userObj?.display_name || userObj?.displayName) updateSet.user_name = userObj.display_name || userObj.displayName;
+    if (hasActivePass) {
+      updateSet.has_active_pass = true;
+      updateSet.pass_mode = 'VIP Pass';
+    }
+
+    await visitors.updateOne(
+      { visitor_id: visitorId },
+      {
+        $set: updateSet,
+        $setOnInsert: {
+          visitor_id: visitorId,
+          first_seen: now,
+          current_activity: activity,
+          pass_mode: hasActivePass ? 'VIP Pass' : '3h Free Trial',
+          has_active_pass: hasActivePass,
+          visit_count: 1,
+          watch_seconds: 0,
+          referrer: req.get('referer') || 'Direct'
+        }
+      },
+      { upsert: true }
+    );
+
+    if (!prev) {
+      await analyticsCounters.updateOne(
+        { key: `daily:${today}` },
+        {
+          $set: { kind: 'daily', date: today, updated_at: now },
+          $inc: { visits: 1 }
+        },
+        { upsert: true }
+      );
+    }
+  } catch {}
+}
+
+app.get('/healthz', async (req, res) => {
+  trackRequestVisitor(req, 'Browsing Home');
   try { await db.command({ ping: 1 }); res.json({ ok: true }); }
   catch { res.status(503).json({ ok: false }); }
 });
 
-app.get('/api/plans', (_req, res) => {
+app.get('/api/plans', (req, res) => {
+  trackRequestVisitor(req, 'Viewing VIP Plans');
   res.json({ currency: 'UGX', plans: PLAN_LIST });
 });
 
@@ -269,6 +422,7 @@ app.post('/api/auth/login', throttle({ limit: 15 }), async (req, res) => {
     if (!user.email_verified_at && (process.env.RESEND_API_KEY && process.env.EMAIL_FROM)) return fail(res, 403, 'Verify your email before signing in.');
     const subscription = await subscriptions.findOne({ user_id: user.id });
     users.updateOne({ id: user.id }, { $set: { last_login_at: new Date(), updated_at: new Date() } }).catch(() => {});
+    trackRequestVisitor(req, 'Signed In', user);
     res.json({
       token: signJwt(user),
       user: { id: user.id, email: user.email, displayName: user.display_name, avatar: user.avatar || null },
@@ -443,6 +597,7 @@ app.get('/api/me', userOnly, async (req, res) => {
       }
     }
 
+    trackRequestVisitor(req, 'Browsing Home', req.user);
     res.json({
       user: { id: req.user.id, email: req.user.email, displayName: req.user.display_name, avatar: req.user.avatar || null },
       subscriptionExpiresAt: expiry,
@@ -451,7 +606,8 @@ app.get('/api/me', userOnly, async (req, res) => {
   } catch (error) { res.status(500).json(publicError(error)); }
 });
 
-app.get('/api/prices/card', async (_req, res) => {
+app.get('/api/prices/card', async (req, res) => {
+  trackRequestVisitor(req, 'Browsing Home');
   const plans = PLAN_LIST.filter((plan) => CARD_PRICES_USD[plan.id] !== undefined).map((plan) => ({
     id: plan.id,
     amountUgx: plan.amountUgx,
@@ -1005,13 +1161,221 @@ app.post('/api/analytics/event', throttle({ windowMs: 60 * 1000, limit: 180 }), 
   }
 });
 
+app.post('/api/analytics/sync-browser', throttle({ windowMs: 60 * 1000, limit: 60 }), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const visitorId = String(body.visitorId || '').trim().slice(0, 80);
+    if (!visitorId) return res.json({ ok: false });
+
+    const now = new Date();
+    const today = todayKeyUtc(now);
+    const uaInfo = parseUserAgentInfo(req.get('user-agent') || '', Boolean(body.isTv));
+    const user = body.user || null;
+    const progressItems = Array.isArray(body.progressItems) ? body.progressItems.slice(0, 100) : [];
+    const watchlistItems = Array.isArray(body.watchlistItems) ? body.watchlistItems.slice(0, 100) : [];
+    const sharesList = Array.isArray(body.sharesList) ? body.sharesList.slice(0, 60) : [];
+    const searchesList = Array.isArray(body.searchesList) ? body.searchesList.slice(0, 60) : [];
+    const watchSecondsUsed = Math.max(0, Number(body.watchSecondsUsed) || 0);
+    const activity = String(body.activity || 'Browsing Home').slice(0, 140);
+    const hasActivePass = Boolean(body.hasActivePass);
+    const passMode = String(body.passMode || (hasActivePass ? 'VIP Pass' : '3h Free Trial')).slice(0, 40);
+
+    // Register live session
+    const prev = liveSessions.get(visitorId);
+    liveSessions.set(visitorId, {
+      visitorId,
+      userId: user?.id || prev?.userId || null,
+      userEmail: user?.email || prev?.userEmail || null,
+      userName: user?.displayName || prev?.userName || null,
+      deviceType: uaInfo.deviceType,
+      os: uaInfo.os,
+      browser: uaInfo.browser,
+      isPwa: Boolean(body.isPwa),
+      passMode,
+      hasActivePass,
+      freeRemainingSec: body.freeRemainingSec ?? prev?.freeRemainingSec ?? null,
+      activity,
+      itemId: body.itemId || prev?.itemId || null,
+      itemTitle: body.itemTitle || prev?.itemTitle || null,
+      itemType: body.itemType || prev?.itemType || null,
+      vj: body.vj || prev?.vj || null,
+      startedAt: prev?.startedAt || now,
+      lastSeen: now
+    });
+
+    const existingVisitor = await visitors.findOne({ visitor_id: visitorId });
+    const alreadySyncedIds = new Set(existingVisitor?.synced_item_ids || []);
+    const newSyncedIds = [...alreadySyncedIds];
+
+    let newlyAddedPlays = 0;
+    let newlyAddedWatchSec = 0;
+
+    for (const item of progressItems) {
+      if (!item || !item.id) continue;
+      const itemId = String(item.id).slice(0, 100);
+      const watchSec = Math.max(10, Math.round(Number(item.watchSec) || 60));
+      const isNewForVisitor = !alreadySyncedIds.has(`play:${itemId}`);
+      if (isNewForVisitor) {
+        newSyncedIds.push(`play:${itemId}`);
+        newlyAddedPlays++;
+        newlyAddedWatchSec += watchSec;
+        await analyticsCounters.updateOne(
+          { key: `play_item:${itemId}` },
+          {
+            $set: {
+              kind: 'play_item',
+              item_id: itemId,
+              title: String(item.title || itemId).slice(0, 160),
+              item_type: String(item.type || 'film').slice(0, 30),
+              vj: String(item.vj || '').slice(0, 60),
+              poster: String(item.poster || '').slice(0, 400),
+              updated_at: now
+            },
+            $inc: { count: 1, watch_seconds: watchSec }
+          },
+          { upsert: true }
+        );
+        if (item.vj) {
+          const vjName = String(item.vj).slice(0, 60);
+          await analyticsCounters.updateOne(
+            { key: `vj_play:${vjName}` },
+            {
+              $set: { kind: 'vj_play', vj: vjName, updated_at: now },
+              $inc: { count: 1, watch_seconds: watchSec }
+            },
+            { upsert: true }
+          );
+        }
+      }
+    }
+
+    for (const w of watchlistItems) {
+      if (!w || !w.id) continue;
+      const itemId = String(w.id).slice(0, 100);
+      if (!alreadySyncedIds.has(`wl:${itemId}`)) {
+        newSyncedIds.push(`wl:${itemId}`);
+        await analyticsCounters.updateOne(
+          { key: `watchlist_item:${itemId}` },
+          {
+            $set: {
+              kind: 'watchlist_item',
+              item_id: itemId,
+              title: String(w.title || itemId).slice(0, 160),
+              item_type: String(w.type || 'film').slice(0, 30),
+              vj: String(w.vj || '').slice(0, 60),
+              poster: String(w.poster || '').slice(0, 400),
+              updated_at: now
+            },
+            $inc: { count: 1 }
+          },
+          { upsert: true }
+        );
+      }
+    }
+
+    for (const sh of sharesList) {
+      if (!sh || !sh.item_id) continue;
+      const itemId = String(sh.item_id).slice(0, 100);
+      if (!alreadySyncedIds.has(`sh:${itemId}`)) {
+        newSyncedIds.push(`sh:${itemId}`);
+        const c = Math.max(1, Number(sh.count) || 1);
+        const o = Math.max(0, Number(sh.share_opens) || 0);
+        await analyticsCounters.updateOne(
+          { key: `share_item:${itemId}` },
+          {
+            $set: {
+              kind: 'share_item',
+              item_id: itemId,
+              title: String(sh.title || itemId).slice(0, 160),
+              item_type: String(sh.item_type || 'film').slice(0, 30),
+              vj: String(sh.vj || '').slice(0, 60),
+              updated_at: now
+            },
+            $inc: { count: c, share_opens: o }
+          },
+          { upsert: true }
+        );
+      }
+    }
+
+    for (const sq of searchesList) {
+      if (!sq || !sq.query) continue;
+      const normQ = String(sq.query).toLowerCase().trim().slice(0, 120);
+      if (normQ.length >= 2 && !alreadySyncedIds.has(`sq:${normQ}`)) {
+        newSyncedIds.push(`sq:${normQ}`);
+        const c = Math.max(1, Number(sq.count) || 1);
+        await analyticsCounters.updateOne(
+          { key: `search_query:${normQ}` },
+          {
+            $set: {
+              kind: 'search_query',
+              query: normQ,
+              display_query: String(sq.display_query || sq.query).slice(0, 120),
+              results_count: Number(sq.results_count) || 0,
+              zero_results: Boolean(sq.zero_results),
+              updated_at: now
+            },
+            $inc: { count: c }
+          },
+          { upsert: true }
+        );
+      }
+    }
+
+    const totalVisWatch = Math.max(existingVisitor?.watch_seconds || 0, watchSecondsUsed, newlyAddedWatchSec);
+    await visitors.updateOne(
+      { visitor_id: visitorId },
+      {
+        $set: {
+          last_seen: now,
+          device_type: uaInfo.deviceType,
+          os: uaInfo.os,
+          browser: uaInfo.browser,
+          is_pwa: Boolean(body.isPwa),
+          pass_mode: passMode,
+          has_active_pass: hasActivePass,
+          current_activity: activity,
+          watch_seconds: totalVisWatch,
+          synced_item_ids: newSyncedIds.slice(-300),
+          ...(user?.id ? { user_id: user.id } : {}),
+          ...(user?.email ? { user_email: user.email } : {}),
+          ...(user?.displayName ? { user_name: user.displayName } : {})
+        },
+        $setOnInsert: {
+          visitor_id: visitorId,
+          first_seen: now,
+          visit_count: 1,
+          referrer: 'Direct'
+        }
+      },
+      { upsert: true }
+    );
+
+    if (newlyAddedPlays > 0 || newlyAddedWatchSec > 0) {
+      await analyticsCounters.updateOne(
+        { key: `daily:${today}` },
+        {
+          $set: { kind: 'daily', date: today, updated_at: now },
+          $inc: { plays: newlyAddedPlays, watch_seconds: newlyAddedWatchSec, visits: existingVisitor ? 0 : 1 }
+        },
+        { upsert: true }
+      );
+    }
+
+    res.json({ ok: true, syncedPlays: newlyAddedPlays });
+  } catch (err) {
+    console.warn('sync-browser error:', err.message);
+    res.json({ ok: false });
+  }
+});
+
 app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
   try {
     const now = new Date();
     const startOfToday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const liveCutoff = new Date(now.getTime() - 90 * 1000);
+    const liveCutoff = new Date(now.getTime() - 5 * 60 * 1000);
 
     const [
       totalUniqueVisitors,
