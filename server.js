@@ -36,6 +36,7 @@ let visitors;
 let analyticsEvents;
 let analyticsCounters;
 let userRequests;
+let adminMessages;
 const liveSessions = new Map();
 const ADMIN_PIN = process.env.ADMIN_PIN || 'avioc2026';
 
@@ -161,6 +162,7 @@ async function ensureSchema() {
   analyticsEvents = db.collection('analytics_events');
   analyticsCounters = db.collection('analytics_counters');
   userRequests = db.collection('user_requests');
+  adminMessages = db.collection('admin_messages');
   await Promise.all([
     users.createIndex({ email: 1 }, { unique: true }),
     users.createIndex({ verify_token_hash: 1 }, { sparse: true }),
@@ -177,7 +179,10 @@ async function ensureSchema() {
     analyticsEvents.createIndex({ type: 1, created_at: -1 }),
     analyticsCounters.createIndex({ key: 1 }, { unique: true }),
     analyticsCounters.createIndex({ kind: 1, count: -1 }),
-    userRequests.createIndex({ created_at: -1 })
+    userRequests.createIndex({ created_at: -1 }),
+    adminMessages.createIndex({ target_id: 1, status: 1 }),
+    adminMessages.createIndex({ created_at: -1 }),
+    adminMessages.createIndex({ id: 1 }, { unique: true })
   ]);
   await backfillHistoricalAnalytics();
 }
@@ -1365,7 +1370,23 @@ app.post('/api/analytics/sync-browser', throttle({ windowMs: 60 * 1000, limit: 6
       );
     }
 
-    res.json({ ok: true, syncedPlays: newlyAddedPlays });
+    let pendingMessages = [];
+    try {
+      const conditions = [{ target_id: visitorId }, { target_type: 'all' }];
+      if (user?.id) conditions.push({ target_id: user.id });
+      const rawMsgs = await adminMessages.find({ status: 'unread', $or: conditions }).sort({ created_at: -1 }).limit(5).toArray();
+      pendingMessages = rawMsgs
+        .filter((m) => !(m.target_type === 'all' && Array.isArray(m.dismissed_ids) && m.dismissed_ids.includes(visitorId)))
+        .map((m) => ({
+          id: m.id,
+          sender: m.sender || 'Admin',
+          message: m.message,
+          targetType: m.target_type,
+          createdAt: m.created_at
+        }));
+    } catch {}
+
+    res.json({ ok: true, syncedPlays: newlyAddedPlays, pendingMessages });
   } catch (err) {
     console.warn('sync-browser error:', err.message);
     res.json({ ok: false });
@@ -1399,7 +1420,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       allUsers,
       allSubscriptions,
       allPayments,
-      allUserRequests
+      allUserRequests,
+      allAdminMessages
     ] = await Promise.all([
       visitors.countDocuments(),
       visitors.countDocuments({ last_seen: { $gte: startOfToday } }),
@@ -1419,7 +1441,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       users.find({}, { projection: { password_hash: 0, verify_token_hash: 0, reset_token_hash: 0 } }).sort({ created_at: -1 }).toArray(),
       subscriptions.find({}).toArray(),
       payments.find({}).sort({ created_at: -1 }).limit(300).toArray(),
-      userRequests.find({}).sort({ created_at: -1 }).limit(200).toArray()
+      userRequests.find({}).sort({ created_at: -1 }).limit(200).toArray(),
+      adminMessages.find({}).sort({ created_at: -1 }).limit(100).toArray()
     ]);
 
     // Merge in-memory liveSessions with DB liveVisitorDocs
@@ -1678,6 +1701,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       paidMembers,
       payments: allPayments.slice(0, 150),
       userRequests: allUserRequests,
+      adminMessages: allAdminMessages,
       recentVisitors: recentVisitors.slice(0, 100),
       recentActivity: recentEvents.slice(0, 80)
     });
@@ -1858,6 +1882,187 @@ app.post('/api/admin/delete-request', requireAdmin, async (req, res) => {
     if (!id) return fail(res, 400, 'Missing request id.');
     await userRequests.deleteOne({ id });
     res.json({ ok: true, message: 'Request removed.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/send-message', requireAdmin, async (req, res) => {
+  try {
+    const targetType = ['visitor', 'user', 'all'].includes(req.body?.targetType) ? req.body.targetType : 'visitor';
+    const targetId = String(req.body?.targetId || '').trim();
+    const targetName = String(req.body?.targetName || '').trim() || (targetType === 'all' ? 'All Active Viewers' : 'Viewer');
+    const message = String(req.body?.message || '').trim().slice(0, 1000);
+
+    if (!message) return fail(res, 400, 'Please enter a message to send.');
+    if (targetType !== 'all' && !targetId) return fail(res, 400, 'Missing target recipient ID.');
+
+    const now = new Date();
+    const id = crypto.randomUUID();
+    const doc = {
+      id,
+      sender: 'Admin',
+      target_type: targetType,
+      target_id: targetId,
+      target_name: targetName,
+      message,
+      status: 'unread',
+      dismissed_ids: [],
+      dismissed_at: null,
+      reply_text: null,
+      replied_at: null,
+      replied_by: null,
+      created_at: now,
+      updated_at: now
+    };
+
+    await adminMessages.insertOne(doc);
+
+    await analyticsEvents.insertOne({
+      id: crypto.randomUUID(),
+      type: 'admin_message_sent',
+      visitor_id: targetType === 'visitor' ? targetId : 'broadcast',
+      user_id: targetType === 'user' ? targetId : null,
+      activity: `Admin message sent to ${targetName}: "${message.slice(0, 50)}"`,
+      created_at: now
+    });
+
+    res.json({ ok: true, message: `Message successfully sent to ${targetName}!`, msgId: id });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/delete-message', requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.body?.id || '').trim();
+    if (!id) return fail(res, 400, 'Missing message id.');
+    await adminMessages.deleteOne({ id });
+    res.json({ ok: true, message: 'Message removed.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.get('/api/messages/pending', async (req, res) => {
+  try {
+    const visitorId = String(req.query.visitorId || req.get('x-visitor-id') || '').trim();
+    const userId = String(req.query.userId || '').trim();
+
+    if (!visitorId && !userId) return res.json({ ok: true, messages: [] });
+
+    const conditions = [];
+    if (visitorId) conditions.push({ target_id: visitorId });
+    if (userId) conditions.push({ target_id: userId });
+    conditions.push({ target_type: 'all' });
+
+    const list = await adminMessages.find({ status: 'unread', $or: conditions }).sort({ created_at: -1 }).limit(10).toArray();
+
+    const active = list.filter((m) => {
+      if (m.target_type === 'all' && Array.isArray(m.dismissed_ids) && visitorId && m.dismissed_ids.includes(visitorId)) {
+        return false;
+      }
+      return true;
+    });
+
+    res.json({
+      ok: true,
+      messages: active.map((m) => ({
+        id: m.id,
+        sender: m.sender || 'Admin',
+        message: m.message,
+        targetType: m.target_type,
+        createdAt: m.created_at
+      }))
+    });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/messages/dismiss', async (req, res) => {
+  try {
+    const messageId = String(req.body?.messageId || '').trim();
+    const visitorId = String(req.body?.visitorId || req.get('x-visitor-id') || '').trim();
+    if (!messageId) return fail(res, 400, 'Missing messageId.');
+
+    const msg = await adminMessages.findOne({ id: messageId });
+    if (!msg) return res.json({ ok: true });
+
+    const now = new Date();
+    if (msg.target_type === 'all') {
+      if (visitorId) {
+        await adminMessages.updateOne({ id: messageId }, { $addToSet: { dismissed_ids: visitorId }, $set: { updated_at: now } });
+      }
+    } else {
+      await adminMessages.updateOne({ id: messageId }, { $set: { status: 'read', dismissed_at: now, updated_at: now } });
+    }
+
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/messages/reply', async (req, res) => {
+  try {
+    const messageId = String(req.body?.messageId || '').trim();
+    const replyText = String(req.body?.replyText || '').trim().slice(0, 1000);
+    const visitorId = String(req.body?.visitorId || req.get('x-visitor-id') || '').trim();
+    const userId = String(req.body?.userId || '').trim() || null;
+    const userName = String(req.body?.userName || '').trim() || 'Viewer';
+
+    if (!messageId) return fail(res, 400, 'Missing messageId.');
+    if (!replyText) return fail(res, 400, 'Please enter a reply.');
+
+    const now = new Date();
+    const msg = await adminMessages.findOne({ id: messageId });
+
+    if (msg) {
+      await adminMessages.updateOne(
+        { id: messageId },
+        {
+          $set: {
+            status: 'replied',
+            reply_text: replyText,
+            replied_at: now,
+            replied_by: {
+              visitor_id: visitorId,
+              user_id: userId,
+              user_name: userName
+            },
+            updated_at: now
+          }
+        }
+      );
+    }
+
+    const reqDoc = {
+      id: crypto.randomUUID(),
+      kind: 'message',
+      text: `[Reply to "${(msg?.message || '').slice(0, 40)}..."]: ${replyText}`,
+      visitor_id: visitorId || null,
+      user_id: userId,
+      user_name: userName,
+      contact: userName,
+      status: 'open',
+      reply_to_message_id: messageId,
+      created_at: now,
+      updated_at: now
+    };
+    await userRequests.insertOne(reqDoc);
+
+    await analyticsEvents.insertOne({
+      id: crypto.randomUUID(),
+      type: 'user_message',
+      visitor_id: visitorId || 'guest',
+      user_id: userId,
+      user_name: userName,
+      activity: `Replied to Admin: "${replyText.slice(0, 50)}"`,
+      created_at: now
+    });
+
+    res.json({ ok: true, message: 'Reply sent to Admin!' });
   } catch (error) {
     res.status(500).json(publicError(error));
   }
