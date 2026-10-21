@@ -32,11 +32,16 @@ let users;
 let payments;
 let subscriptions;
 let webhookEvents;
+let visitors;
+let analyticsEvents;
+let analyticsCounters;
+const liveSessions = new Map();
+const ADMIN_PIN = process.env.ADMIN_PIN || 'avioc2026';
 
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '32kb' }));
+app.use(express.json({ limit: '64kb' }));
 app.use((req, res, next) => {
   res.set('Cache-Control', 'no-store');
   res.set('X-Content-Type-Options', 'nosniff');
@@ -44,7 +49,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin || '*';
   res.set('Access-Control-Allow-Origin', origin);
   res.set('Vary', 'Origin');
-  res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept');
+  res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, X-Admin-Key');
   res.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.set('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -151,6 +156,9 @@ async function ensureSchema() {
   payments = db.collection('payments');
   subscriptions = db.collection('subscriptions');
   webhookEvents = db.collection('webhook_events');
+  visitors = db.collection('visitors');
+  analyticsEvents = db.collection('analytics_events');
+  analyticsCounters = db.collection('analytics_counters');
   await Promise.all([
     users.createIndex({ email: 1 }, { unique: true }),
     users.createIndex({ verify_token_hash: 1 }, { sparse: true }),
@@ -159,7 +167,14 @@ async function ensureSchema() {
     payments.createIndex({ user_id: 1, created_at: -1 }),
     payments.createIndex({ provider_internal_reference: 1 }, { unique: true, partialFilterExpression: { provider_internal_reference: { $type: 'string' } } }),
     subscriptions.createIndex({ user_id: 1 }, { unique: true }),
-    webhookEvents.createIndex({ event_key: 1 }, { unique: true })
+    webhookEvents.createIndex({ event_key: 1 }, { unique: true }),
+    visitors.createIndex({ visitor_id: 1 }, { unique: true }),
+    visitors.createIndex({ last_seen: -1 }),
+    visitors.createIndex({ user_id: 1 }),
+    analyticsEvents.createIndex({ created_at: -1 }),
+    analyticsEvents.createIndex({ type: 1, created_at: -1 }),
+    analyticsCounters.createIndex({ key: 1 }, { unique: true }),
+    analyticsCounters.createIndex({ kind: 1, count: -1 })
   ]);
 }
 
@@ -253,6 +268,7 @@ app.post('/api/auth/login', throttle({ limit: 15 }), async (req, res) => {
     if (!user || !verifyPassword(password, user.password_hash)) return fail(res, 401, 'Email or password is incorrect.');
     if (!user.email_verified_at && (process.env.RESEND_API_KEY && process.env.EMAIL_FROM)) return fail(res, 403, 'Verify your email before signing in.');
     const subscription = await subscriptions.findOne({ user_id: user.id });
+    users.updateOne({ id: user.id }, { $set: { last_login_at: new Date(), updated_at: new Date() } }).catch(() => {});
     res.json({
       token: signJwt(user),
       user: { id: user.id, email: user.email, displayName: user.display_name, avatar: user.avatar || null },
@@ -644,6 +660,762 @@ app.post('/api/payments/livepay-webhook', throttle({ limit: 120 }), async (req, 
   }
 
   res.sendStatus(200);
+});
+
+/* ===================== Real-time Analytics & Admin API ===================== */
+function todayKeyUtc(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+function parseUserAgentInfo(uaRaw = '', isTvHint = false) {
+  const ua = String(uaRaw || '');
+  let deviceType = 'Desktop';
+  if (isTvHint || /tv|smarttv|googletv|androidtv|hbbtv|appletv|crkey|tizen|webos|bravia|hisense|aft[bms]|netcast|viera|roku|mibox|shield/i.test(ua)) {
+    deviceType = 'Smart TV';
+  } else if (/ipad|tablet|playbook|silk/i.test(ua) || (/android/i.test(ua) && !/mobile/i.test(ua))) {
+    deviceType = 'Tablet';
+  } else if (/mobi|iphone|ipod|android.*mobile|windows phone/i.test(ua)) {
+    deviceType = 'Mobile';
+  }
+  let os = 'Other';
+  if (/android/i.test(ua)) os = 'Android';
+  else if (/iphone|ipad|ipod/i.test(ua)) os = 'iOS';
+  else if (/windows/i.test(ua)) os = 'Windows';
+  else if (/mac os x|macintosh/i.test(ua)) os = 'macOS';
+  else if (/cros/i.test(ua)) os = 'ChromeOS';
+  else if (/linux/i.test(ua)) os = 'Linux';
+
+  let browser = 'Browser';
+  if (/edg\//i.test(ua)) browser = 'Edge';
+  else if (/opr\/|opera/i.test(ua)) browser = 'Opera';
+  else if (/samsungbrowser/i.test(ua)) browser = 'Samsung Internet';
+  else if (/chrome\/|crios/i.test(ua)) browser = 'Chrome';
+  else if (/firefox\/|fxios/i.test(ua)) browser = 'Firefox';
+  else if (/safari\//i.test(ua) && !/chrome|crios/i.test(ua)) browser = 'Safari';
+
+  return { deviceType, os, browser };
+}
+
+function requireAdmin(req, res, next) {
+  const key = String(req.get('x-admin-key') || req.query.adminKey || req.body?.adminKey || '').trim();
+  if (!key || key !== ADMIN_PIN) {
+    return fail(res, 401, 'Invalid Admin PIN.');
+  }
+  next();
+}
+
+app.post('/api/analytics/event', throttle({ windowMs: 60 * 1000, limit: 180 }), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const visitorId = String(body.visitorId || '').trim().slice(0, 80);
+    if (!visitorId) return res.status(200).json({ ok: false });
+
+    const eventType = String(body.eventType || 'heartbeat').trim().slice(0, 40);
+    const now = new Date();
+    const today = todayKeyUtc(now);
+    const uaInfo = parseUserAgentInfo(req.get('user-agent') || body.ua || '', Boolean(body.isTv));
+    const deviceType = String(body.deviceType || uaInfo.deviceType).slice(0, 30);
+    const os = String(body.os || uaInfo.os).slice(0, 30);
+    const browser = String(body.browser || uaInfo.browser).slice(0, 30);
+    const isPwa = Boolean(body.isPwa);
+
+    const userId = body.userId ? String(body.userId).slice(0, 80) : null;
+    const userEmail = body.userEmail ? String(body.userEmail).trim().toLowerCase().slice(0, 200) : null;
+    const userName = body.userName ? String(body.userName).trim().slice(0, 80) : null;
+    const passMode = String(body.passMode || '3h Free Trial').slice(0, 40);
+    const hasActivePass = Boolean(body.hasActivePass);
+    const freeRemainingSec = Number.isFinite(Number(body.freeRemainingSec)) ? Number(body.freeRemainingSec) : null;
+
+    const activity = String(body.activity || 'Browsing Home').slice(0, 140);
+    const itemId = body.itemId ? String(body.itemId).slice(0, 100) : null;
+    const itemTitle = body.itemTitle ? String(body.itemTitle).slice(0, 160) : null;
+    const itemType = body.itemType ? String(body.itemType).slice(0, 30) : null;
+    const vj = body.vj ? String(body.vj).slice(0, 60) : null;
+    const poster = body.poster ? String(body.poster).slice(0, 400) : null;
+    const query = body.query ? String(body.query).trim().slice(0, 120) : null;
+    const resultsCount = Number.isFinite(Number(body.resultsCount)) ? Number(body.resultsCount) : null;
+    const watchSec = Math.max(0, Math.min(120, Number(body.watchSec) || 0));
+    const referrer = body.referrer ? String(body.referrer).slice(0, 300) : null;
+
+    // Update live in-memory session
+    const prevSession = liveSessions.get(visitorId);
+    liveSessions.set(visitorId, {
+      visitorId,
+      userId,
+      userEmail,
+      userName,
+      deviceType,
+      os,
+      browser,
+      isPwa,
+      passMode,
+      hasActivePass,
+      freeRemainingSec,
+      activity,
+      itemId,
+      itemTitle,
+      itemType,
+      vj,
+      startedAt: prevSession?.startedAt || now,
+      lastSeen: now
+    });
+    if (liveSessions.size > 2000) {
+      const cutoff = Date.now() - 2 * 60 * 1000;
+      for (const [k, v] of liveSessions) {
+        if (new Date(v.lastSeen).getTime() < cutoff) liveSessions.delete(k);
+      }
+    }
+
+    // Update persistent visitor document
+    const visitorSet = {
+      last_seen: now,
+      device_type: deviceType,
+      os,
+      browser,
+      is_pwa: isPwa,
+      pass_mode: passMode,
+      has_active_pass: hasActivePass,
+      current_activity: activity,
+      current_item_id: itemId,
+      current_item_title: itemTitle,
+      current_item_type: itemType,
+      current_vj: vj
+    };
+    if (userId) visitorSet.user_id = userId;
+    if (userEmail) visitorSet.user_email = userEmail;
+    if (userName) visitorSet.user_name = userName;
+    if (freeRemainingSec !== null) visitorSet.free_remaining_sec = freeRemainingSec;
+
+    const visitorInc = {};
+    if (eventType === 'visit') visitorInc.visit_count = 1;
+    if (watchSec > 0) visitorInc.watch_seconds = watchSec;
+    if (eventType === 'share') visitorInc.share_count = 1;
+    if (eventType === 'search') visitorInc.search_count = 1;
+    if (eventType === 'play') visitorInc.play_count = 1;
+
+    const visitorUpdate = {
+      $set: visitorSet,
+      $setOnInsert: {
+        visitor_id: visitorId,
+        first_seen: now,
+        referrer: referrer || 'Direct'
+      }
+    };
+    if (Object.keys(visitorInc).length) visitorUpdate.$inc = visitorInc;
+    await visitors.updateOne({ visitor_id: visitorId }, visitorUpdate, { upsert: true });
+
+    // Update daily counter
+    const dailyInc = { updated_count: 1 };
+    if (eventType === 'visit') dailyInc.visits = 1;
+    if (watchSec > 0) dailyInc.watch_seconds = watchSec;
+    if (eventType === 'share') dailyInc.shares = 1;
+    if (eventType === 'share_open') dailyInc.share_opens = 1;
+    if (eventType === 'search') dailyInc.searches = 1;
+    if (eventType === 'play') dailyInc.plays = 1;
+    if (eventType === 'paywall_hit') dailyInc.paywall_hits = 1;
+    if (eventType === 'pwa_install') dailyInc.pwa_installs = 1;
+
+    await analyticsCounters.updateOne(
+      { key: `daily:${today}` },
+      {
+        $set: { kind: 'daily', date: today, updated_at: now },
+        $inc: dailyInc
+      },
+      { upsert: true }
+    );
+
+    // Handle specific events
+    if (eventType === 'share' && itemId) {
+      await analyticsCounters.updateOne(
+        { key: `share_item:${itemId}` },
+        {
+          $set: {
+            kind: 'share_item',
+            item_id: itemId,
+            title: itemTitle || itemId,
+            item_type: itemType || 'film',
+            vj: vj || '',
+            poster: poster || '',
+            updated_at: now
+          },
+          $inc: { count: 1 }
+        },
+        { upsert: true }
+      );
+    } else if (eventType === 'share_open' && itemId) {
+      await analyticsCounters.updateOne(
+        { key: `share_item:${itemId}` },
+        {
+          $set: {
+            kind: 'share_item',
+            item_id: itemId,
+            title: itemTitle || itemId,
+            item_type: itemType || 'film',
+            vj: vj || '',
+            poster: poster || '',
+            updated_at: now
+          },
+          $inc: { share_opens: 1 },
+          $setOnInsert: { count: 0 }
+        },
+        { upsert: true }
+      );
+    } else if (eventType === 'search' && query) {
+      const normQ = query.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (normQ.length >= 2) {
+        await analyticsCounters.updateOne(
+          { key: `search_query:${normQ}` },
+          {
+            $set: {
+              kind: 'search_query',
+              query: normQ,
+              display_query: query,
+              results_count: resultsCount ?? 0,
+              zero_results: (resultsCount ?? 0) === 0,
+              updated_at: now
+            },
+            $inc: { count: 1 }
+          },
+          { upsert: true }
+        );
+      }
+    } else if (eventType === 'play' && itemId) {
+      await analyticsCounters.updateOne(
+        { key: `play_item:${itemId}` },
+        {
+          $set: {
+            kind: 'play_item',
+            item_id: itemId,
+            title: itemTitle || itemId,
+            item_type: itemType || 'film',
+            vj: vj || '',
+            poster: poster || '',
+            updated_at: now
+          },
+          $inc: { count: 1 }
+        },
+        { upsert: true }
+      );
+      if (vj) {
+        await analyticsCounters.updateOne(
+          { key: `vj_play:${vj}` },
+          {
+            $set: { kind: 'vj_play', vj, updated_at: now },
+            $inc: { count: 1 }
+          },
+          { upsert: true }
+        );
+      }
+    } else if (eventType === 'watch_tick' && watchSec > 0 && itemId) {
+      await analyticsCounters.updateOne(
+        { key: `play_item:${itemId}` },
+        {
+          $set: {
+            kind: 'play_item',
+            item_id: itemId,
+            title: itemTitle || itemId,
+            item_type: itemType || 'film',
+            vj: vj || '',
+            updated_at: now
+          },
+          $inc: { watch_seconds: watchSec },
+          $setOnInsert: { count: 1 }
+        },
+        { upsert: true }
+      );
+      if (vj) {
+        await analyticsCounters.updateOne(
+          { key: `vj_play:${vj}` },
+          {
+            $set: { kind: 'vj_play', vj, updated_at: now },
+            $inc: { watch_seconds: watchSec },
+            $setOnInsert: { count: 1 }
+          },
+          { upsert: true }
+        );
+      }
+    } else if (eventType === 'watchlist' && itemId) {
+      const added = body.added !== false;
+      await analyticsCounters.updateOne(
+        { key: `watchlist_item:${itemId}` },
+        {
+          $set: {
+            kind: 'watchlist_item',
+            item_id: itemId,
+            title: itemTitle || itemId,
+            item_type: itemType || 'film',
+            vj: vj || '',
+            poster: poster || '',
+            updated_at: now
+          },
+          $inc: { count: added ? 1 : -1 }
+        },
+        { upsert: true }
+      );
+    } else if (eventType === 'stream_error' && itemId) {
+      await analyticsCounters.updateOne(
+        { key: `error_item:${itemId}` },
+        {
+          $set: {
+            kind: 'error_item',
+            item_id: itemId,
+            title: itemTitle || itemId,
+            item_type: itemType || 'film',
+            vj: vj || '',
+            updated_at: now
+          },
+          $inc: { count: 1 }
+        },
+        { upsert: true }
+      );
+    }
+
+    // Store discrete event log for non-heartbeat events
+    if (!['heartbeat', 'watch_tick'].includes(eventType)) {
+      await analyticsEvents.insertOne({
+        id: crypto.randomUUID(),
+        type: eventType,
+        visitor_id: visitorId,
+        user_id: userId,
+        user_email: userEmail,
+        user_name: userName,
+        device_type: deviceType,
+        os,
+        browser,
+        is_pwa: isPwa,
+        pass_mode: passMode,
+        has_active_pass: hasActivePass,
+        activity,
+        item_id: itemId,
+        item_title: itemTitle,
+        item_type: itemType,
+        vj,
+        poster,
+        query,
+        results_count: resultsCount,
+        referrer,
+        created_at: now
+      });
+    }
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.warn('Analytics event error:', error.message);
+    res.status(200).json({ ok: false });
+  }
+});
+
+app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
+  try {
+    const now = new Date();
+    const startOfToday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const liveCutoff = new Date(now.getTime() - 90 * 1000);
+
+    const [
+      totalUniqueVisitors,
+      visitorsToday,
+      visitors7d,
+      visitors30d,
+      liveVisitorDocs,
+      recentVisitors,
+      dailyCounters,
+      topShared,
+      topSearches,
+      zeroResultSearches,
+      topPlayed,
+      topVjs,
+      topWatchlist,
+      streamErrors,
+      recentEvents,
+      allUsers,
+      allSubscriptions,
+      allPayments
+    ] = await Promise.all([
+      visitors.countDocuments(),
+      visitors.countDocuments({ last_seen: { $gte: startOfToday } }),
+      visitors.countDocuments({ last_seen: { $gte: sevenDaysAgo } }),
+      visitors.countDocuments({ last_seen: { $gte: thirtyDaysAgo } }),
+      visitors.find({ last_seen: { $gte: liveCutoff } }).sort({ last_seen: -1 }).limit(200).toArray(),
+      visitors.find({}).sort({ last_seen: -1 }).limit(120).toArray(),
+      analyticsCounters.find({ kind: 'daily' }).sort({ date: -1 }).limit(30).toArray(),
+      analyticsCounters.find({ kind: 'share_item' }).sort({ count: -1, share_opens: -1 }).limit(40).toArray(),
+      analyticsCounters.find({ kind: 'search_query' }).sort({ count: -1 }).limit(50).toArray(),
+      analyticsCounters.find({ kind: 'search_query', zero_results: true }).sort({ count: -1 }).limit(30).toArray(),
+      analyticsCounters.find({ kind: 'play_item' }).sort({ count: -1, watch_seconds: -1 }).limit(50).toArray(),
+      analyticsCounters.find({ kind: 'vj_play' }).sort({ count: -1, watch_seconds: -1 }).limit(25).toArray(),
+      analyticsCounters.find({ kind: 'watchlist_item', count: { $gt: 0 } }).sort({ count: -1 }).limit(30).toArray(),
+      analyticsCounters.find({ kind: 'error_item', count: { $gt: 0 } }).sort({ count: -1, updated_at: -1 }).limit(30).toArray(),
+      analyticsEvents.find({}).sort({ created_at: -1 }).limit(120).toArray(),
+      users.find({}, { projection: { password_hash: 0, verify_token_hash: 0, reset_token_hash: 0 } }).sort({ created_at: -1 }).toArray(),
+      subscriptions.find({}).toArray(),
+      payments.find({}).sort({ created_at: -1 }).limit(300).toArray()
+    ]);
+
+    // Merge in-memory liveSessions with DB liveVisitorDocs
+    const liveMap = new Map();
+    for (const doc of liveVisitorDocs) {
+      liveMap.set(doc.visitor_id, {
+        visitorId: doc.visitor_id,
+        userId: doc.user_id || null,
+        userEmail: doc.user_email || null,
+        userName: doc.user_name || null,
+        deviceType: doc.device_type || 'Desktop',
+        os: doc.os || 'Other',
+        browser: doc.browser || 'Browser',
+        isPwa: Boolean(doc.is_pwa),
+        passMode: doc.pass_mode || '3h Free Trial',
+        hasActivePass: Boolean(doc.has_active_pass),
+        freeRemainingSec: doc.free_remaining_sec ?? null,
+        activity: doc.current_activity || 'Browsing Home',
+        itemId: doc.current_item_id || null,
+        itemTitle: doc.current_item_title || null,
+        itemType: doc.current_item_type || null,
+        vj: doc.current_vj || null,
+        lastSeen: doc.last_seen
+      });
+    }
+    for (const [vid, s] of liveSessions) {
+      if (new Date(s.lastSeen) >= liveCutoff) {
+        liveMap.set(vid, s);
+      }
+    }
+    const activeSessions = Array.from(liveMap.values()).sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
+    let watchingMovieCount = 0;
+    let watchingTvCount = 0;
+    let browsingCount = 0;
+    for (const s of activeSessions) {
+      if (s.itemType === 'tv' || String(s.activity || '').toLowerCase().includes('live tv')) watchingTvCount++;
+      else if (s.itemType === 'film' || s.itemType === 'series' || String(s.activity || '').toLowerCase().startsWith('watching')) watchingMovieCount++;
+      else browsingCount++;
+    }
+
+    // Subscriptions & Payments maps
+    const subByUser = new Map(allSubscriptions.map((s) => [s.user_id, s]));
+    const visitorByUser = new Map();
+    for (const v of recentVisitors) {
+      if (v.user_id && !visitorByUser.has(v.user_id)) visitorByUser.set(v.user_id, v);
+    }
+
+    const paymentsByUser = new Map();
+    let totalRevenueUgx = 0;
+    let totalRevenueUsd = 0;
+    let revenueTodayUgx = 0;
+    let revenue30dUgx = 0;
+    let totalPaymentsSuccess = 0;
+    let totalPaymentsPending = 0;
+    let totalPaymentsFailed = 0;
+
+    for (const p of allPayments) {
+      const uid = p.user_id;
+      if (uid) {
+        if (!paymentsByUser.has(uid)) {
+          paymentsByUser.set(uid, {
+            totalPaidUgx: 0,
+            totalPaidUsd: 0,
+            successCount: 0,
+            pendingCount: 0,
+            failedCount: 0,
+            lastPayment: p,
+            lastSuccessPayment: null
+          });
+        }
+        const entry = paymentsByUser.get(uid);
+        if (p.status === 'success') {
+          entry.successCount++;
+          entry.totalPaidUgx += Number(p.amount_ugx) || 0;
+          if (p.currency === 'USD') entry.totalPaidUsd += Number(p.amount) || 0;
+          if (!entry.lastSuccessPayment) entry.lastSuccessPayment = p;
+        } else if (p.status === 'pending') {
+          entry.pendingCount++;
+        } else {
+          entry.failedCount++;
+        }
+      }
+      if (p.status === 'success') {
+        totalPaymentsSuccess++;
+        const ugx = Number(p.amount_ugx) || 0;
+        totalRevenueUgx += ugx;
+        if (p.currency === 'USD') totalRevenueUsd += Number(p.amount) || 0;
+        const pDate = new Date(p.completed_at || p.created_at);
+        if (pDate >= startOfToday) revenueTodayUgx += ugx;
+        if (pDate >= thirtyDaysAgo) revenue30dUgx += ugx;
+      } else if (p.status === 'pending') {
+        totalPaymentsPending++;
+      } else {
+        totalPaymentsFailed++;
+      }
+    }
+
+    // Build enriched members list
+    let activePaidPasses = 0;
+    let expiredPasses = 0;
+    let newMembersToday = 0;
+    let newMembers7d = 0;
+    let verifiedMembers = 0;
+
+    const members = allUsers.map((u) => {
+      const sub = subByUser.get(u.id);
+      const payInfo = paymentsByUser.get(u.id);
+      const vis = visitorByUser.get(u.id);
+      const expiresAt = sub?.expires_at ? new Date(sub.expires_at) : null;
+      const isActivePass = Boolean(expiresAt && expiresAt > now);
+      if (isActivePass) activePaidPasses++;
+      else if (expiresAt) expiredPasses++;
+
+      const createdAt = u.created_at ? new Date(u.created_at) : null;
+      if (createdAt && createdAt >= startOfToday) newMembersToday++;
+      if (createdAt && createdAt >= sevenDaysAgo) newMembers7d++;
+      if (u.email_verified_at) verifiedMembers++;
+
+      const remainingHours = isActivePass ? Math.max(0, Math.round((expiresAt.getTime() - now.getTime()) / (1000 * 60 * 60))) : 0;
+      const lastSuccess = payInfo?.lastSuccessPayment;
+
+      return {
+        id: u.id,
+        email: u.email,
+        displayName: u.display_name || u.email.split('@')[0],
+        avatar: u.avatar || null,
+        verified: Boolean(u.email_verified_at),
+        createdAt: u.created_at,
+        lastLoginAt: u.last_login_at || vis?.last_seen || u.updated_at || u.created_at,
+        subscriptionExpiresAt: expiresAt ? expiresAt.toISOString() : null,
+        hasActivePass: isActivePass,
+        remainingHours,
+        grantedByAdmin: Boolean(sub?.granted_by_admin),
+        lastPlanId: lastSuccess?.plan_id || sub?.plan_id || payInfo?.lastPayment?.plan_id || null,
+        lastPaymentMethod: lastSuccess?.payment_method || payInfo?.lastPayment?.payment_method || (sub?.granted_by_admin ? 'admin_grant' : null),
+        lastNetwork: lastSuccess?.network || payInfo?.lastPayment?.network || null,
+        lastPhone: lastSuccess?.phone_number || payInfo?.lastPayment?.phone_number || null,
+        totalPaidUgx: payInfo?.totalPaidUgx || 0,
+        totalPaidUsd: payInfo?.totalPaidUsd || 0,
+        successPaymentsCount: payInfo?.successCount || 0,
+        pendingPaymentsCount: payInfo?.pendingCount || 0,
+        failedPaymentsCount: payInfo?.failedCount || 0,
+        lastPaidAt: lastSuccess?.completed_at || lastSuccess?.created_at || (isActivePass ? sub?.updated_at : null),
+        deviceType: vis?.device_type || null,
+        os: vis?.os || null,
+        watchSeconds: vis?.watch_seconds || 0,
+        currentActivity: vis?.current_activity || null
+      };
+    });
+
+    const paidMembers = members.filter((m) => m.hasActivePass || m.successPaymentsCount > 0 || m.subscriptionExpiresAt);
+
+    // Aggregate totals from counters
+    let totalVisits = 0;
+    let totalWatchSeconds = 0;
+    let totalShares = 0;
+    let totalShareOpens = 0;
+    let totalSearches = 0;
+    let totalPlays = 0;
+    let paywallHits = 0;
+    let pwaInstalls = 0;
+
+    for (const d of dailyCounters) {
+      totalVisits += Number(d.visits) || 0;
+      totalWatchSeconds += Number(d.watch_seconds) || 0;
+      totalShares += Number(d.shares) || 0;
+      totalShareOpens += Number(d.share_opens) || 0;
+      totalSearches += Number(d.searches) || 0;
+      totalPlays += Number(d.plays) || 0;
+      paywallHits += Number(d.paywall_hits) || 0;
+      pwaInstalls += Number(d.pwa_installs) || 0;
+    }
+
+    // Device & OS & Pass funnel breakdown from recentVisitors
+    const deviceBreakdown = { Mobile: 0, 'Smart TV': 0, Desktop: 0, Tablet: 0 };
+    const osBreakdown = {};
+    const passFunnel = { 'VIP Pass': 0, '3h Free Trial': 0, '30m Daily Free': 0, 'Trial Ended': 0 };
+    for (const v of recentVisitors) {
+      const dt = v.device_type || 'Desktop';
+      deviceBreakdown[dt] = (deviceBreakdown[dt] || 0) + 1;
+      const o = v.os || 'Other';
+      osBreakdown[o] = (osBreakdown[o] || 0) + 1;
+      if (v.has_active_pass) passFunnel['VIP Pass']++;
+      else if (String(v.pass_mode || '').includes('daily')) passFunnel['30m Daily Free']++;
+      else if (String(v.pass_mode || '').includes('exhausted') || (v.free_remaining_sec !== undefined && v.free_remaining_sec !== null && v.free_remaining_sec <= 0)) passFunnel['Trial Ended']++;
+      else passFunnel['3h Free Trial']++;
+    }
+
+    const recentShares = recentEvents.filter((e) => e.type === 'share' || e.type === 'share_open').slice(0, 40);
+    const recentSearches = recentEvents.filter((e) => e.type === 'search').slice(0, 40);
+    const topPlayedMovies = topPlayed.filter((x) => x.item_type !== 'tv').slice(0, 30);
+    const topPlayedTv = topPlayed.filter((x) => x.item_type === 'tv').slice(0, 20);
+
+    res.json({
+      generatedAt: now.toISOString(),
+      live: {
+        onlineCount: activeSessions.length,
+        watchingMovieCount,
+        watchingTvCount,
+        browsingCount,
+        sessions: activeSessions
+      },
+      overview: {
+        totalUniqueVisitors,
+        visitorsToday,
+        visitors7d,
+        visitors30d,
+        totalVisits: Math.max(totalVisits, totalUniqueVisitors),
+        totalWatchHours: Number((totalWatchSeconds / 3600).toFixed(1)),
+        totalWatchSeconds,
+        totalPlays,
+        totalShares,
+        totalShareOpens,
+        totalSearches,
+        zeroResultSearchesCount: zeroResultSearches.length,
+        totalMembers: allUsers.length,
+        verifiedMembers,
+        newMembersToday,
+        newMembers7d,
+        activePaidPasses,
+        expiredPasses,
+        totalPaidMembersCount: paidMembers.length,
+        totalRevenueUgx,
+        totalRevenueUsd: Number(totalRevenueUsd.toFixed(2)),
+        revenueTodayUgx,
+        revenue30dUgx,
+        totalPaymentsSuccess,
+        totalPaymentsPending,
+        totalPaymentsFailed,
+        paywallHits,
+        pwaInstalls
+      },
+      dailySeries: dailyCounters.slice(0, 14).reverse(),
+      breakdown: {
+        devices: deviceBreakdown,
+        os: osBreakdown,
+        passFunnel
+      },
+      shares: {
+        topShared,
+        recentShares
+      },
+      searches: {
+        topSearches,
+        zeroResultSearches,
+        recentSearches
+      },
+      content: {
+        topPlayedMovies,
+        topPlayedTv,
+        topVjs,
+        topWatchlist,
+        streamErrors
+      },
+      members,
+      paidMembers,
+      payments: allPayments.slice(0, 150),
+      recentVisitors: recentVisitors.slice(0, 100),
+      recentActivity: recentEvents.slice(0, 80)
+    });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/grant-pass', requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    const email = normalizeEmail(req.body?.email || '');
+    const days = Number(req.body?.days) || 0;
+    const revoke = Boolean(req.body?.revoke);
+
+    const user = userId ? await users.findOne({ id: userId }) : await users.findOne({ email });
+    if (!user) return fail(res, 404, 'Member account not found.');
+
+    const now = new Date();
+    if (revoke || days <= 0) {
+      await subscriptions.updateOne(
+        { user_id: user.id },
+        { $set: { expires_at: new Date(0), updated_at: now, granted_by_admin: true } },
+        { upsert: true }
+      );
+      return res.json({ message: `Pass revoked for ${user.email}.`, expiresAt: null });
+    }
+
+    const current = await subscriptions.findOne({ user_id: user.id });
+    const startAt = current?.expires_at && new Date(current.expires_at) > now ? new Date(current.expires_at) : now;
+    const expiry = new Date(startAt.getTime() + days * 24 * 60 * 60 * 1000);
+
+    await subscriptions.updateOne(
+      { user_id: user.id },
+      {
+        $set: {
+          expires_at: expiry,
+          updated_at: now,
+          granted_by_admin: true,
+          plan_id: `admin-${days}d`
+        },
+        $setOnInsert: { user_id: user.id }
+      },
+      { upsert: true }
+    );
+
+    res.json({
+      message: `VIP Pass granted to ${user.display_name || user.email} for ${days} day(s) until ${expiry.toLocaleString()}.`,
+      expiresAt: expiry.toISOString()
+    });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/activate-payment', requireAdmin, async (req, res) => {
+  try {
+    const reference = String(req.body?.reference || '').trim();
+    if (!reference) return fail(res, 400, 'Missing payment reference.');
+    const payment = await payments.findOne({ reference });
+    if (!payment) return fail(res, 404, 'Payment reference not found.');
+    if (payment.status === 'success') return res.json({ message: 'Payment is already active.' });
+
+    await activatePaymentSuccess(payment, { provider: 'admin_verified', provider_transaction_id: `ADMIN_${Date.now()}` });
+    res.json({ message: `Payment ${reference} activated and member pass unlocked!` });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/reset-user-password', requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    const newPassword = String(req.body?.newPassword || '');
+    if (!userId) return fail(res, 400, 'Missing userId.');
+    if (newPassword.length < 10 || newPassword.length > 200) return fail(res, 400, 'Password must be at least 10 characters.');
+
+    const user = await users.findOne({ id: userId });
+    if (!user) return fail(res, 404, 'User not found.');
+    const passwordHash = hashPassword(newPassword).encoded;
+    await users.updateOne({ id: user.id }, { $set: { password_hash: passwordHash, updated_at: new Date() } });
+    res.json({ message: `Password updated for ${user.email}.` });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!userId) return fail(res, 400, 'Missing userId.');
+    await Promise.all([
+      users.deleteOne({ id: userId }),
+      subscriptions.deleteOne({ user_id: userId })
+    ]);
+    res.json({ message: 'Member account removed.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/clear-errors', requireAdmin, async (_req, res) => {
+  try {
+    await analyticsCounters.deleteMany({ kind: 'error_item' });
+    res.json({ message: 'Stream error alerts cleared.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
 });
 
 app.use((req, res) => fail(res, 404, 'Route not found.'));
