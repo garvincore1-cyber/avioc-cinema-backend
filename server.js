@@ -1421,7 +1421,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       allSubscriptions,
       allPayments,
       allUserRequests,
-      allAdminMessages
+      allAdminMessages,
+      allRecentSearches
     ] = await Promise.all([
       visitors.countDocuments(),
       visitors.countDocuments({ last_seen: { $gte: startOfToday } }),
@@ -1442,7 +1443,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       subscriptions.find({}).toArray(),
       payments.find({}).sort({ created_at: -1 }).limit(300).toArray(),
       userRequests.find({}).sort({ created_at: -1 }).limit(200).toArray(),
-      adminMessages.find({}).sort({ created_at: -1 }).limit(100).toArray()
+      adminMessages.find({}).sort({ created_at: -1 }).limit(100).toArray(),
+      analyticsEvents.find({ type: 'search' }).sort({ created_at: -1 }).limit(100).toArray()
     ]);
 
     // Merge in-memory liveSessions with DB liveVisitorDocs
@@ -1632,7 +1634,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
     }
 
     const recentShares = recentEvents.filter((e) => e.type === 'share' || e.type === 'share_open').slice(0, 40);
-    const recentSearches = recentEvents.filter((e) => e.type === 'search').slice(0, 40);
+    const recentSearches = (allRecentSearches && allRecentSearches.length) ? allRecentSearches : recentEvents.filter((e) => e.type === 'search').slice(0, 40);
     const topPlayedMovies = topPlayed.filter((x) => x.item_type !== 'tv').slice(0, 30);
     const topPlayedTv = topPlayed.filter((x) => x.item_type === 'tv').slice(0, 20);
 
