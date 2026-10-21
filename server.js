@@ -35,6 +35,7 @@ let webhookEvents;
 let visitors;
 let analyticsEvents;
 let analyticsCounters;
+let userRequests;
 const liveSessions = new Map();
 const ADMIN_PIN = process.env.ADMIN_PIN || 'avioc2026';
 
@@ -159,6 +160,7 @@ async function ensureSchema() {
   visitors = db.collection('visitors');
   analyticsEvents = db.collection('analytics_events');
   analyticsCounters = db.collection('analytics_counters');
+  userRequests = db.collection('user_requests');
   await Promise.all([
     users.createIndex({ email: 1 }, { unique: true }),
     users.createIndex({ verify_token_hash: 1 }, { sparse: true }),
@@ -174,7 +176,8 @@ async function ensureSchema() {
     analyticsEvents.createIndex({ created_at: -1 }),
     analyticsEvents.createIndex({ type: 1, created_at: -1 }),
     analyticsCounters.createIndex({ key: 1 }, { unique: true }),
-    analyticsCounters.createIndex({ kind: 1, count: -1 })
+    analyticsCounters.createIndex({ kind: 1, count: -1 }),
+    userRequests.createIndex({ created_at: -1 })
   ]);
   await backfillHistoricalAnalytics();
 }
@@ -1395,7 +1398,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       recentEvents,
       allUsers,
       allSubscriptions,
-      allPayments
+      allPayments,
+      allUserRequests
     ] = await Promise.all([
       visitors.countDocuments(),
       visitors.countDocuments({ last_seen: { $gte: startOfToday } }),
@@ -1414,7 +1418,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       analyticsEvents.find({}).sort({ created_at: -1 }).limit(120).toArray(),
       users.find({}, { projection: { password_hash: 0, verify_token_hash: 0, reset_token_hash: 0 } }).sort({ created_at: -1 }).toArray(),
       subscriptions.find({}).toArray(),
-      payments.find({}).sort({ created_at: -1 }).limit(300).toArray()
+      payments.find({}).sort({ created_at: -1 }).limit(300).toArray(),
+      userRequests.find({}).sort({ created_at: -1 }).limit(200).toArray()
     ]);
 
     // Merge in-memory liveSessions with DB liveVisitorDocs
@@ -1672,6 +1677,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       members,
       paidMembers,
       payments: allPayments.slice(0, 150),
+      userRequests: allUserRequests,
       recentVisitors: recentVisitors.slice(0, 100),
       recentActivity: recentEvents.slice(0, 80)
     });
@@ -1759,14 +1765,116 @@ app.post('/api/admin/reset-user-password', requireAdmin, async (req, res) => {
   }
 });
 
+app.post('/api/requests', throttle({ windowMs: 60 * 1000, limit: 25 }), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const kind = body.kind === 'message' ? 'message' : 'movie';
+    const text = String(body.text || '').trim().slice(0, 600);
+    if (text.length < 2) return fail(res, 400, 'Please enter your request or message.');
+
+    const vj = String(body.vj || '').trim().slice(0, 80);
+    const contact = String(body.contact || '').trim().slice(0, 140);
+    const visitorId = String(body.visitorId || req.get('x-visitor-id') || '').trim().slice(0, 80);
+    const userId = body.userId ? String(body.userId).slice(0, 80) : null;
+    const userName = String(body.userName || '').trim().slice(0, 80) || null;
+    const userEmail = String(body.userEmail || '').trim().toLowerCase().slice(0, 200) || null;
+    const uaInfo = parseUserAgentInfo(req.get('user-agent') || '', false);
+    const now = new Date();
+    const id = crypto.randomUUID();
+
+    const doc = {
+      id,
+      kind,
+      text,
+      vj: vj || null,
+      contact: contact || null,
+      visitor_id: visitorId || null,
+      user_id: userId,
+      user_name: userName,
+      user_email: userEmail,
+      device_type: uaInfo.deviceType,
+      os: uaInfo.os,
+      status: 'open',
+      created_at: now,
+      updated_at: now
+    };
+    await userRequests.insertOne(doc);
+
+    if (kind === 'movie') {
+      const normQ = text.toLowerCase().replace(/\s+/g, ' ').trim();
+      await analyticsCounters.updateOne(
+        { key: `search_query:${normQ}` },
+        {
+          $set: {
+            kind: 'search_query',
+            query: normQ,
+            display_query: vj ? `${text} (${vj})` : text,
+            results_count: 0,
+            zero_results: true,
+            updated_at: now
+          },
+          $inc: { count: 1 }
+        },
+        { upsert: true }
+      );
+    }
+
+    await analyticsEvents.insertOne({
+      id: crypto.randomUUID(),
+      type: kind === 'movie' ? 'movie_request' : 'user_message',
+      visitor_id: visitorId || 'guest',
+      user_id: userId,
+      user_email: userEmail,
+      user_name: userName,
+      device_type: uaInfo.deviceType,
+      os: uaInfo.os,
+      activity: kind === 'movie' ? `Movie Request: "${text}"${vj ? ` (${vj})` : ''}` : `Message: "${text.slice(0, 80)}"`,
+      query: text,
+      vj: vj || null,
+      created_at: now
+    });
+
+    res.status(201).json({ ok: true, request: doc, message: kind === 'movie' ? 'Movie request sent to Admin!' : 'Message sent to Admin!' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/request-status', requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.body?.id || '').trim();
+    const status = String(req.body?.status || 'done').trim();
+    if (!id) return fail(res, 400, 'Missing request id.');
+    await userRequests.updateOne({ id }, { $set: { status, updated_at: new Date() } });
+    res.json({ ok: true, message: `Request marked as ${status}.` });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/delete-request', requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.body?.id || '').trim();
+    if (!id) return fail(res, 400, 'Missing request id.');
+    await userRequests.deleteOne({ id });
+    res.json({ ok: true, message: 'Request removed.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
 app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
   try {
     const userId = String(req.body?.userId || '').trim();
     if (!userId) return fail(res, 400, 'Missing userId.');
     await Promise.all([
       users.deleteOne({ id: userId }),
-      subscriptions.deleteOne({ user_id: userId })
+      subscriptions.deleteOne({ user_id: userId }),
+      visitors.deleteMany({ $or: [{ user_id: userId }, { visitor_id: `member_${userId}` }] })
     ]);
+    for (const [k, v] of liveSessions) {
+      if (v.userId === userId || k === `member_${userId}`) liveSessions.delete(k);
+    }
     res.json({ message: 'Member account removed.' });
   } catch (error) {
     res.status(500).json(publicError(error));
