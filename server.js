@@ -1895,6 +1895,8 @@ app.post('/api/admin/send-message', requireAdmin, async (req, res) => {
     const targetId = String(req.body?.targetId || '').trim();
     const targetName = String(req.body?.targetName || '').trim() || (targetType === 'all' ? 'All Active Viewers' : 'Viewer');
     const message = String(req.body?.message || '').trim().slice(0, 1000);
+    const btnYes = String(req.body?.btnYes || 'Yes').trim().slice(0, 30) || 'Yes';
+    const btnNo = req.body?.btnNo !== undefined ? String(req.body.btnNo || '').trim().slice(0, 30) : 'No';
 
     if (!message) return fail(res, 400, 'Please enter a message to send.');
     if (targetType !== 'all' && !targetId) return fail(res, 400, 'Missing target recipient ID.');
@@ -1908,6 +1910,8 @@ app.post('/api/admin/send-message', requireAdmin, async (req, res) => {
       target_id: targetId,
       target_name: targetName,
       message,
+      btn_yes: btnYes,
+      btn_no: btnNo,
       status: 'unread',
       dismissed_ids: [],
       dismissed_at: null,
@@ -1974,6 +1978,8 @@ app.get('/api/messages/pending', async (req, res) => {
         sender: m.sender || 'Admin',
         message: m.message,
         targetType: m.target_type,
+        btnYes: m.btn_yes || 'Yes',
+        btnNo: m.btn_no !== undefined ? m.btn_no : 'No',
         createdAt: m.created_at
       }))
     });
