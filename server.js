@@ -2016,16 +2016,18 @@ app.post('/api/admin/delete-request', requireAdmin, async (req, res) => {
 
 app.post('/api/admin/send-message', requireAdmin, async (req, res) => {
   try {
-    const targetType = ['visitor', 'user', 'all'].includes(req.body?.targetType) ? req.body.targetType : 'visitor';
-    const targetId = String(req.body?.targetId || '').trim();
-    const targetName = String(req.body?.targetName || '').trim() || (targetType === 'all' ? 'All Active Viewers' : 'Viewer');
+    const rawTargetType = req.body?.targetType || req.body?.target_type;
+    const targetType = ['visitor', 'user', 'all'].includes(rawTargetType) ? rawTargetType : 'visitor';
+    const targetId = String(req.body?.targetId || req.body?.target_id || '').trim();
+    const targetName = String(req.body?.targetName || req.body?.target_name || '').trim() || (targetType === 'all' ? 'All Active Viewers' : 'Viewer');
     const title = String(req.body?.title || '').trim().slice(0, 100) || 'Avioc Cinema';
     const message = String(req.body?.message || '').trim().slice(0, 1000);
-    const ctaType = ['none', 'payment', 'google_signin', 'play_movie'].includes(req.body?.ctaType) ? req.body.ctaType : 'none';
-    const ctaText = String(req.body?.ctaText || '').trim().slice(0, 50);
-    const movieId = String(req.body?.movieId || '').trim().slice(0, 100);
-    const btnYes = String(req.body?.btnYes || (ctaText || 'Yes')).trim().slice(0, 30) || 'Yes';
-    const btnNo = req.body?.btnNo !== undefined ? String(req.body.btnNo || '').trim().slice(0, 30) : 'No';
+    const rawCtaType = req.body?.ctaType || req.body?.cta_type;
+    const ctaType = ['none', 'payment', 'google_signin', 'play_movie'].includes(rawCtaType) ? rawCtaType : 'none';
+    const ctaText = String(req.body?.ctaText || req.body?.cta_text || '').trim().slice(0, 50);
+    const movieId = String(req.body?.movieId || req.body?.movie_id || '').trim().slice(0, 100);
+    const btnYes = String(req.body?.btnYes || req.body?.btn_yes || (ctaText || 'Yes')).trim().slice(0, 30) || 'Yes';
+    const btnNo = req.body?.btnNo !== undefined ? String(req.body.btnNo || '').trim().slice(0, 30) : (req.body?.btn_no !== undefined ? String(req.body.btn_no || '').trim().slice(0, 30) : 'No');
 
     if (!message) return fail(res, 400, 'Please enter a message to send.');
     if (targetType !== 'all' && !targetId) return fail(res, 400, 'Missing target recipient ID.');
@@ -2164,8 +2166,8 @@ app.post('/api/admin/force-refresh', requireAdmin, async (_req, res) => {
 
 app.get('/api/messages/pending', async (req, res) => {
   try {
-    const visitorId = String(req.query.visitorId || req.get('x-visitor-id') || '').trim();
-    const userId = String(req.query.userId || '').trim();
+    const visitorId = String(req.query.visitorId || req.query.visitor_id || req.get('x-visitor-id') || '').trim();
+    const userId = String(req.query.userId || req.query.user_id || '').trim();
 
     const baseResponse = {
       ok: true,
@@ -2240,11 +2242,11 @@ app.post('/api/messages/dismiss', async (req, res) => {
 
 app.post('/api/messages/reply', async (req, res) => {
   try {
-    const messageId = String(req.body?.messageId || '').trim();
-    const replyText = String(req.body?.replyText || '').trim().slice(0, 1000);
-    const visitorId = String(req.body?.visitorId || req.get('x-visitor-id') || '').trim();
-    const userId = String(req.body?.userId || '').trim() || null;
-    const userName = String(req.body?.userName || '').trim() || 'Viewer';
+    const messageId = String(req.body?.messageId || req.body?.message_id || '').trim();
+    const replyText = String(req.body?.replyText || req.body?.reply_text || '').trim().slice(0, 1000);
+    const visitorId = String(req.body?.visitorId || req.body?.visitor_id || req.get('x-visitor-id') || '').trim();
+    const userId = String(req.body?.userId || req.body?.user_id || '').trim() || null;
+    const userName = String(req.body?.userName || req.body?.user_name || '').trim() || 'Viewer';
 
     if (!messageId) return fail(res, 400, 'Missing messageId.');
     if (!replyText) return fail(res, 400, 'Please enter a reply.');
