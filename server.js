@@ -37,6 +37,7 @@ let analyticsEvents;
 let analyticsCounters;
 let userRequests;
 let adminMessages;
+let shareReferrals;
 const liveSessions = new Map();
 const ADMIN_PIN = process.env.ADMIN_PIN || 'avioc2026';
 
@@ -163,6 +164,7 @@ async function ensureSchema() {
   analyticsCounters = db.collection('analytics_counters');
   userRequests = db.collection('user_requests');
   adminMessages = db.collection('admin_messages');
+  shareReferrals = db.collection('share_referrals');
   await Promise.all([
     users.createIndex({ email: 1 }, { unique: true }),
     users.createIndex({ verify_token_hash: 1 }, { sparse: true }),
@@ -182,7 +184,9 @@ async function ensureSchema() {
     userRequests.createIndex({ created_at: -1 }),
     adminMessages.createIndex({ target_id: 1, status: 1 }),
     adminMessages.createIndex({ created_at: -1 }),
-    adminMessages.createIndex({ id: 1 }, { unique: true })
+    adminMessages.createIndex({ id: 1 }, { unique: true }),
+    shareReferrals.createIndex({ referrer_id: 1 }, { unique: true }),
+    shareReferrals.createIndex({ visitors_count: -1 })
   ]);
   await backfillHistoricalAnalytics();
 }
@@ -458,6 +462,23 @@ app.post('/api/auth/google', throttle({ limit: 30 }), async (req, res) => {
         }
       } catch (e) {
         console.warn('Failed to parse Google JWT payload:', e);
+      }
+    }
+
+    const accessToken = req.body?.accessToken;
+    if (accessToken && !email) {
+      try {
+        const uRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        if (uRes.ok) {
+          const uData = await uRes.json();
+          if (uData.email) email = normalizeEmail(uData.email);
+          if (uData.name && !name) name = String(uData.name).trim();
+          if (uData.picture && !avatar) avatar = String(uData.picture).trim();
+        }
+      } catch (e) {
+        console.warn('Google userinfo fetch failed:', e);
       }
     }
 
@@ -1444,16 +1465,30 @@ app.post('/api/analytics/sync-browser', throttle({ windowMs: 60 * 1000, limit: 6
 
     let pendingMessages = [];
     try {
-      const conditions = [{ target_id: visitorId }, { target_type: 'all' }];
-      if (user?.id) conditions.push({ target_id: user.id });
-      const rawMsgs = await adminMessages.find({ status: 'unread', $or: conditions }).sort({ created_at: -1 }).limit(5).toArray();
+      const conditions = [{ target_type: 'all' }];
+      if (visitorId) conditions.push({ target_id: visitorId, status: 'unread' });
+      if (user?.id) conditions.push({ target_id: user.id, status: 'unread' });
+      const rawMsgs = await adminMessages.find({ $or: conditions }).sort({ created_at: -1 }).limit(10).toArray();
       pendingMessages = rawMsgs
-        .filter((m) => !(m.target_type === 'all' && Array.isArray(m.dismissed_ids) && m.dismissed_ids.includes(visitorId)))
+        .filter((m) => {
+          if (m.target_type === 'all') {
+            if (visitorId && Array.isArray(m.dismissed_ids) && m.dismissed_ids.includes(visitorId)) return false;
+            if (visitorId && Array.isArray(m.replied_ids) && m.replied_ids.includes(visitorId)) return false;
+            return true;
+          }
+          return m.status === 'unread';
+        })
         .map((m) => ({
           id: m.id,
           sender: m.sender || 'Admin',
+          title: m.title || 'Avioc Cinema',
           message: m.message,
           targetType: m.target_type,
+          ctaType: m.cta_type || 'none',
+          ctaText: m.cta_text || '',
+          movieId: m.movie_id || '',
+          btnYes: m.btn_yes || 'Yes',
+          btnNo: m.btn_no !== undefined ? m.btn_no : 'No',
           createdAt: m.created_at
         }));
     } catch {}
@@ -1494,7 +1529,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       allPayments,
       allUserRequests,
       allAdminMessages,
-      allRecentSearches
+      allRecentSearches,
+      allShareReferrals
     ] = await Promise.all([
       visitors.countDocuments(),
       visitors.countDocuments({ last_seen: { $gte: startOfToday } }),
@@ -1516,7 +1552,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       payments.find({}).sort({ created_at: -1 }).limit(300).toArray(),
       userRequests.find({}).sort({ created_at: -1 }).limit(200).toArray(),
       adminMessages.find({}).sort({ created_at: -1 }).limit(100).toArray(),
-      analyticsEvents.find({ type: 'search' }).sort({ created_at: -1 }).limit(100).toArray()
+      analyticsEvents.find({ type: 'search' }).sort({ created_at: -1 }).limit(100).toArray(),
+      shareReferrals.find({}).sort({ visitors_count: -1, last_visit_at: -1 }).limit(100).toArray()
     ]);
 
     // Merge in-memory liveSessions with DB liveVisitorDocs
@@ -1776,6 +1813,22 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       payments: allPayments.slice(0, 150),
       userRequests: allUserRequests,
       adminMessages: allAdminMessages,
+      topReferrers: (allShareReferrals || []).map((r) => {
+        const sub = (allSubscriptions || []).find((s) => s.user_id === r.referrer_uid);
+        const hasActiveVip = sub && sub.expires_at ? new Date(sub.expires_at) > now : false;
+        return {
+          referrerId: r.referrer_id,
+          referrerUid: r.referrer_uid || null,
+          referrerVid: r.referrer_vid || null,
+          referrerName: r.referrer_name || 'Viewer',
+          referrerEmail: r.referrer_email || null,
+          visitorsCount: r.visitors_count || (Array.isArray(r.unique_visitors) ? r.unique_visitors.length : 0),
+          totalHits: r.total_hits || 0,
+          itemsShared: Array.isArray(r.items_shared) ? r.items_shared : (r.last_item_title ? [r.last_item_title] : []),
+          lastVisitAt: r.last_visit_at || r.created_at,
+          hasActiveVip
+        };
+      }),
       recentVisitors: recentVisitors.slice(0, 100),
       recentActivity: recentEvents.slice(0, 80)
     });
@@ -1966,8 +2019,12 @@ app.post('/api/admin/send-message', requireAdmin, async (req, res) => {
     const targetType = ['visitor', 'user', 'all'].includes(req.body?.targetType) ? req.body.targetType : 'visitor';
     const targetId = String(req.body?.targetId || '').trim();
     const targetName = String(req.body?.targetName || '').trim() || (targetType === 'all' ? 'All Active Viewers' : 'Viewer');
+    const title = String(req.body?.title || '').trim().slice(0, 100) || 'Avioc Cinema';
     const message = String(req.body?.message || '').trim().slice(0, 1000);
-    const btnYes = String(req.body?.btnYes || 'Yes').trim().slice(0, 30) || 'Yes';
+    const ctaType = ['none', 'payment', 'google_signin', 'play_movie'].includes(req.body?.ctaType) ? req.body.ctaType : 'none';
+    const ctaText = String(req.body?.ctaText || '').trim().slice(0, 50);
+    const movieId = String(req.body?.movieId || '').trim().slice(0, 100);
+    const btnYes = String(req.body?.btnYes || (ctaText || 'Yes')).trim().slice(0, 30) || 'Yes';
     const btnNo = req.body?.btnNo !== undefined ? String(req.body.btnNo || '').trim().slice(0, 30) : 'No';
 
     if (!message) return fail(res, 400, 'Please enter a message to send.');
@@ -1977,11 +2034,15 @@ app.post('/api/admin/send-message', requireAdmin, async (req, res) => {
     const id = crypto.randomUUID();
     const doc = {
       id,
-      sender: 'Admin',
+      sender: 'Avioc Cinema',
+      title,
       target_type: targetType,
       target_id: targetId,
       target_name: targetName,
       message,
+      cta_type: ctaType,
+      cta_text: ctaText,
+      movie_id: movieId,
       btn_yes: btnYes,
       btn_no: btnNo,
       status: 'unread',
@@ -2022,34 +2083,127 @@ app.post('/api/admin/delete-message', requireAdmin, async (req, res) => {
   }
 });
 
+app.post('/api/referrals/visit', throttle({ limit: 60 }), async (req, res) => {
+  try {
+    const referrerUid = String(req.body?.referrerUid || '').trim();
+    const referrerVid = String(req.body?.referrerVid || '').trim();
+    let referrerName = String(req.body?.referrerName || '').trim();
+    const visitorId = String(req.body?.visitorId || req.get('x-visitor-id') || '').trim();
+    const itemId = String(req.body?.itemId || '').trim();
+    const itemTitle = String(req.body?.itemTitle || '').trim();
+
+    const referrerId = referrerUid || referrerVid;
+    if (!referrerId || !visitorId) return res.json({ ok: true, skipped: true });
+    if (referrerId === visitorId || (referrerUid && referrerUid === req.user?.id)) {
+      return res.json({ ok: true, self: true });
+    }
+
+    let referrerEmail = '';
+    if (referrerUid) {
+      const u = await users.findOne({ id: referrerUid });
+      if (u) {
+        referrerEmail = u.email || '';
+        if (!referrerName || referrerName === 'Viewer') referrerName = u.display_name || u.email.split('@')[0];
+      }
+    }
+
+    const now = new Date();
+    await shareReferrals.updateOne(
+      { referrer_id: referrerId },
+      {
+        $setOnInsert: {
+          referrer_id: referrerId,
+          referrer_uid: referrerUid || null,
+          referrer_vid: referrerVid || null,
+          created_at: now
+        },
+        $set: {
+          referrer_name: referrerName || 'Viewer',
+          referrer_email: referrerEmail || null,
+          last_visit_at: now,
+          last_item_title: itemTitle || null
+        },
+        $addToSet: {
+          unique_visitors: visitorId,
+          ...(itemTitle ? { items_shared: itemTitle } : {})
+        },
+        $inc: { total_hits: 1 }
+      },
+      { upsert: true }
+    );
+
+    const rec = await shareReferrals.findOne({ referrer_id: referrerId });
+    if (rec && Array.isArray(rec.unique_visitors)) {
+      await shareReferrals.updateOne({ referrer_id: referrerId }, { $set: { visitors_count: rec.unique_visitors.length } });
+    }
+
+    await analyticsEvents.insertOne({
+      id: crypto.randomUUID(),
+      type: 'referral_visit',
+      visitor_id: visitorId,
+      activity: `Visited via link shared by ${referrerName || referrerId}: ${itemTitle || 'Avioc Cinema'}`,
+      item_id: itemId || null,
+      item_title: itemTitle || null,
+      created_at: now
+    });
+
+    res.json({ ok: true, referrerName });
+  } catch (err) {
+    res.status(500).json(publicError(err));
+  }
+});
+
+let globalForceRefreshAt = Date.now();
+let globalEnforceGoogleAuth = true;
+
+app.post('/api/admin/force-refresh', requireAdmin, async (_req, res) => {
+  globalForceRefreshAt = Date.now();
+  globalEnforceGoogleAuth = true;
+  res.json({ ok: true, forceRefreshAt: globalForceRefreshAt, enforceGoogleAuth: true });
+});
+
 app.get('/api/messages/pending', async (req, res) => {
   try {
     const visitorId = String(req.query.visitorId || req.get('x-visitor-id') || '').trim();
     const userId = String(req.query.userId || '').trim();
 
-    if (!visitorId && !userId) return res.json({ ok: true, messages: [] });
+    const baseResponse = {
+      ok: true,
+      forceRefreshAt: globalForceRefreshAt,
+      enforceGoogleAuth: globalEnforceGoogleAuth,
+      messages: []
+    };
 
-    const conditions = [];
-    if (visitorId) conditions.push({ target_id: visitorId });
-    if (userId) conditions.push({ target_id: userId });
-    conditions.push({ target_type: 'all' });
+    if (!visitorId && !userId) return res.json(baseResponse);
 
-    const list = await adminMessages.find({ status: 'unread', $or: conditions }).sort({ created_at: -1 }).limit(10).toArray();
+    const conditions = [{ target_type: 'all' }];
+    if (visitorId) conditions.push({ target_id: visitorId, status: 'unread' });
+    if (userId) conditions.push({ target_id: userId, status: 'unread' });
+
+    const list = await adminMessages.find({ $or: conditions }).sort({ created_at: -1 }).limit(15).toArray();
 
     const active = list.filter((m) => {
-      if (m.target_type === 'all' && Array.isArray(m.dismissed_ids) && visitorId && m.dismissed_ids.includes(visitorId)) {
-        return false;
+      if (m.target_type === 'all') {
+        if (visitorId && Array.isArray(m.dismissed_ids) && m.dismissed_ids.includes(visitorId)) return false;
+        if (visitorId && Array.isArray(m.replied_ids) && m.replied_ids.includes(visitorId)) return false;
+        return true;
       }
-      return true;
+      return m.status === 'unread';
     });
 
     res.json({
       ok: true,
+      forceRefreshAt: globalForceRefreshAt,
+      enforceGoogleAuth: globalEnforceGoogleAuth,
       messages: active.map((m) => ({
         id: m.id,
-        sender: m.sender || 'Admin',
+        sender: m.sender || 'Avioc Cinema',
+        title: m.title || 'Avioc Cinema',
         message: m.message,
         targetType: m.target_type,
+        ctaType: m.cta_type || 'none',
+        ctaText: m.cta_text || '',
+        movieId: m.movie_id || '',
         btnYes: m.btn_yes || 'Yes',
         btnNo: m.btn_no !== undefined ? m.btn_no : 'No',
         createdAt: m.created_at
@@ -2099,50 +2253,63 @@ app.post('/api/messages/reply', async (req, res) => {
     const msg = await adminMessages.findOne({ id: messageId });
 
     if (msg) {
-      await adminMessages.updateOne(
-        { id: messageId },
-        {
-          $set: {
-            status: 'replied',
-            reply_text: replyText,
-            replied_at: now,
-            replied_by: {
-              visitor_id: visitorId,
-              user_id: userId,
-              user_name: userName
+      if (msg.target_type === 'all') {
+        await adminMessages.updateOne(
+          { id: messageId },
+          {
+            $set: {
+              last_replied_at: now,
+              updated_at: now
             },
-            updated_at: now
+            $addToSet: {
+              dismissed_ids: visitorId,
+              replied_ids: visitorId
+            },
+            $push: {
+              replies: {
+                reply_text: replyText,
+                visitor_id: visitorId,
+                user_id: userId,
+                user_name: userName,
+                replied_at: now
+              }
+            }
           }
-        }
-      );
+        );
+      } else {
+        await adminMessages.updateOne(
+          { id: messageId },
+          {
+            $set: {
+              status: 'replied',
+              reply_text: replyText,
+              replied_at: now,
+              replied_by: {
+                visitor_id: visitorId,
+                user_id: userId,
+                user_name: userName
+              },
+              updated_at: now
+            }
+          }
+        );
+      }
     }
 
     const reqDoc = {
       id: crypto.randomUUID(),
       kind: 'message',
-      text: `[Reply to "${(msg?.message || '').slice(0, 40)}..."]: ${replyText}`,
+      text: `[Response to "${msg?.title || 'Announcement'}"]: ${replyText}`,
       visitor_id: visitorId || null,
       user_id: userId,
       user_name: userName,
-      contact: userName,
-      status: 'open',
-      reply_to_message_id: messageId,
+      status: 'pending',
       created_at: now,
       updated_at: now
     };
     await userRequests.insertOne(reqDoc);
 
-    await analyticsEvents.insertOne({
-      id: crypto.randomUUID(),
-      type: 'user_message',
-      visitor_id: visitorId || 'guest',
-      user_id: userId,
-      user_name: userName,
-      activity: `Replied to Admin: "${replyText.slice(0, 50)}"`,
-      created_at: now
-    });
-
-    res.json({ ok: true, message: 'Reply sent to Admin!' });
+    res.json({ ok: true, message: 'Reply sent successfully.' });
   } catch (error) {
     res.status(500).json(publicError(error));
   }
