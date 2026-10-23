@@ -24,6 +24,15 @@ const PLAN_LIST = [
   { id: 'days-60', days: 60, amountUgx: 38000 },
   { id: 'days-90', days: 90, amountUgx: 55000 }
 ];
+const OFFER_PLANS = [
+  { id: 'offer-500', days: 1, amountUgx: 500, label: '24-Hour Weekend Special Pass (500 UGX)', isOffer: true },
+  { id: 'offer-1500', days: 7, amountUgx: 1500, label: '7-Day Promo Pass (1,500 UGX)', isOffer: true },
+  { id: 'offer-5000', days: 30, amountUgx: 5000, label: '30-Day VIP Pass (5,000 UGX)', isOffer: true }
+];
+
+function findPlan(id) {
+  return [...PLAN_LIST, ...OFFER_PLANS].find((item) => item.id === String(id || ''));
+}
 const CARD_PRICES_USD = { 'days-14': 3.8, 'days-30': 6.0, 'days-60': 9.0, 'days-90': 11.5 };
 
 let mongoClient;
@@ -349,7 +358,7 @@ app.get('/healthz', async (req, res) => {
 
 app.get('/api/plans', (req, res) => {
   trackRequestVisitor(req, 'Viewing VIP Plans');
-  res.json({ currency: 'UGX', plans: PLAN_LIST });
+  res.json({ currency: 'UGX', plans: PLAN_LIST, offerPlans: OFFER_PLANS });
 });
 
 app.post('/api/auth/register', throttle({ limit: 15 }), async (req, res) => {
@@ -644,7 +653,7 @@ async function confirmAtLivePay(reference, currency = 'UGX') {
 
 async function activatePaymentSuccess(payment, livepayData = {}) {
   if (!payment) return false;
-  const plan = PLAN_LIST.find((item) => item.id === payment.plan_id);
+  const plan = findPlan(payment.plan_id);
   if (!plan) return false;
   const now = new Date();
   await payments.updateOne(
@@ -720,7 +729,7 @@ app.get('/api/prices/card', async (req, res) => {
 function newReference() { return `AV${crypto.randomBytes(13).toString('hex').toUpperCase()}`; }
 
 app.post('/api/payments', userOnly, throttle({ limit: 10 }), async (req, res) => {
-  const plan = PLAN_LIST.find((item) => item.id === String(req.body?.planId || ''));
+  const plan = findPlan(req.body?.planId);
   const method = String(req.body?.method || '');
   if (!plan) return fail(res, 400, 'Choose a valid subscription plan.');
   if (!['mobile_money', 'card'].includes(method)) return fail(res, 400, 'Choose mobile money or card.');
@@ -2029,6 +2038,23 @@ app.post('/api/admin/send-message', requireAdmin, async (req, res) => {
     const btnYes = String(req.body?.btnYes || req.body?.btn_yes || (ctaText || 'Yes')).trim().slice(0, 30) || 'Yes';
     const btnNo = req.body?.btnNo !== undefined ? String(req.body.btnNo || '').trim().slice(0, 30) : (req.body?.btn_no !== undefined ? String(req.body.btn_no || '').trim().slice(0, 30) : 'No');
 
+    let offerPlan = String(req.body?.offerPlan || req.body?.offer_plan || '').trim();
+    let offerPrice = Number(req.body?.offerPrice || req.body?.offer_price) || 0;
+    let offerDays = Number(req.body?.offerDays || req.body?.offer_days) || 0;
+
+    if (!offerPlan && (ctaType === 'payment' || /500\s*(?:ugx|shs|shillings)?/i.test(message))) {
+      if (/500/i.test(message)) {
+        offerPlan = 'offer-500';
+      }
+    }
+    if (offerPlan) {
+      const p = findPlan(offerPlan);
+      if (p) {
+        offerPrice = p.amountUgx;
+        offerDays = p.days;
+      }
+    }
+
     if (!message) return fail(res, 400, 'Please enter a message to send.');
     if (targetType !== 'all' && !targetId) return fail(res, 400, 'Missing target recipient ID.');
 
@@ -2047,6 +2073,9 @@ app.post('/api/admin/send-message', requireAdmin, async (req, res) => {
       movie_id: movieId,
       btn_yes: btnYes,
       btn_no: btnNo,
+      offer_plan: offerPlan || null,
+      offer_price: offerPrice || null,
+      offer_days: offerDays || null,
       status: 'unread',
       dismissed_ids: [],
       dismissed_at: null,
@@ -2197,19 +2226,34 @@ app.get('/api/messages/pending', async (req, res) => {
       ok: true,
       forceRefreshAt: globalForceRefreshAt,
       enforceGoogleAuth: globalEnforceGoogleAuth,
-      messages: active.map((m) => ({
-        id: m.id,
-        sender: m.sender || 'Avioc Cinema',
-        title: m.title || 'Avioc Cinema',
-        message: m.message,
-        targetType: m.target_type,
-        ctaType: m.cta_type || 'none',
-        ctaText: m.cta_text || '',
-        movieId: m.movie_id || '',
-        btnYes: m.btn_yes || 'Yes',
-        btnNo: m.btn_no !== undefined ? m.btn_no : 'No',
-        createdAt: m.created_at
-      }))
+      messages: active.map((m) => {
+        let offerPlan = m.offer_plan || null;
+        let offerPrice = m.offer_price || null;
+        let offerDays = m.offer_days || null;
+        if (!offerPlan && (m.cta_type === 'payment' || /500\s*(?:ugx|shs|shillings)?/i.test(m.message || ''))) {
+          if (/500/i.test(m.message || '')) {
+            offerPlan = 'offer-500';
+            offerPrice = 500;
+            offerDays = 1;
+          }
+        }
+        return {
+          id: m.id,
+          sender: m.sender || 'Avioc Cinema',
+          title: m.title || 'Avioc Cinema',
+          message: m.message,
+          targetType: m.target_type,
+          ctaType: m.cta_type || 'none',
+          ctaText: m.cta_text || '',
+          movieId: m.movie_id || '',
+          btnYes: m.btn_yes || 'Yes',
+          btnNo: m.btn_no !== undefined ? m.btn_no : 'No',
+          offerPlan,
+          offerPrice,
+          offerDays,
+          createdAt: m.created_at
+        };
+      })
     });
   } catch (error) {
     res.status(500).json(publicError(error));
