@@ -197,6 +197,14 @@ async function ensureSchema() {
     shareReferrals.createIndex({ referrer_id: 1 }, { unique: true }),
     shareReferrals.createIndex({ visitors_count: -1 })
   ]);
+  // Expire any stale broadcast messages older than 30 minutes so visitors don't get unwanted automatic popups
+  try {
+    const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000);
+    await adminMessages.updateMany(
+      { target_type: 'all', status: 'unread', created_at: { $lt: thirtyMinsAgo } },
+      { $set: { status: 'expired', expired_at: new Date() } }
+    );
+  } catch {}
   await backfillHistoricalAnalytics();
 }
 
@@ -2185,12 +2193,24 @@ app.post('/api/referrals/visit', throttle({ limit: 60 }), async (req, res) => {
 });
 
 let globalForceRefreshAt = Date.now();
-let globalEnforceGoogleAuth = true;
+let globalEnforceGoogleAuth = false;
 
 app.post('/api/admin/force-refresh', requireAdmin, async (_req, res) => {
   globalForceRefreshAt = Date.now();
   globalEnforceGoogleAuth = true;
   res.json({ ok: true, forceRefreshAt: globalForceRefreshAt, enforceGoogleAuth: true });
+});
+
+app.post('/api/admin/dismiss-all-broadcasts', requireAdmin, async (_req, res) => {
+  try {
+    const result = await adminMessages.updateMany(
+      { target_type: 'all', status: 'unread' },
+      { $set: { status: 'dismissed', dismissed_at: new Date() } }
+    );
+    res.json({ ok: true, message: `Dismissed ${result.modifiedCount} active broadcast(s).` });
+  } catch (err) {
+    res.status(500).json(publicError(err));
+  }
 });
 
 app.get('/api/messages/pending', async (req, res) => {
@@ -2207,16 +2227,26 @@ app.get('/api/messages/pending', async (req, res) => {
 
     if (!visitorId && !userId) return res.json(baseResponse);
 
-    const conditions = [{ target_type: 'all' }];
+    const conditions = [];
     if (visitorId) conditions.push({ target_id: visitorId, status: 'unread' });
     if (userId) conditions.push({ target_id: userId, status: 'unread' });
+
+    // Only deliver broadcasts created in the last 30 minutes that are still unread
+    const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000);
+    conditions.push({
+      target_type: 'all',
+      status: 'unread',
+      created_at: { $gte: thirtyMinsAgo }
+    });
 
     const list = await adminMessages.find({ $or: conditions }).sort({ created_at: -1 }).limit(15).toArray();
 
     const active = list.filter((m) => {
       if (m.target_type === 'all') {
+        if (m.status !== 'unread') return false;
         if (visitorId && Array.isArray(m.dismissed_ids) && m.dismissed_ids.includes(visitorId)) return false;
         if (visitorId && Array.isArray(m.replied_ids) && m.replied_ids.includes(visitorId)) return false;
+        if (new Date(m.created_at).getTime() < Date.now() - 30 * 60 * 1000) return false;
         return true;
       }
       return m.status === 'unread';
