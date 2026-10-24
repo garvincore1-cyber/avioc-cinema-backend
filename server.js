@@ -2024,8 +2024,71 @@ app.post('/api/admin/delete-request', requireAdmin, async (req, res) => {
   try {
     const id = String(req.body?.id || '').trim();
     if (!id) return fail(res, 400, 'Missing request id.');
-    await userRequests.deleteOne({ id });
+    await userRequests.deleteOne({ $or: [{ id }, { _id: id }] });
     res.json({ ok: true, message: 'Request removed.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/clear-requests', requireAdmin, async (req, res) => {
+  try {
+    const kind = String(req.body?.kind || 'all').trim();
+    const filter = kind === 'all' ? {} : (kind === 'message' ? { kind: 'message' } : { kind: { $ne: 'message' } });
+    const result = await userRequests.deleteMany(filter);
+    res.json({ ok: true, message: `Cleared ${result.deletedCount || 0} user requests/messages.`, count: result.deletedCount || 0 });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/delete-search-event', requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.body?.id || req.body?.eventId || '').trim();
+    if (!id) return fail(res, 400, 'Missing search event ID.');
+    await analyticsEvents.deleteOne({ $or: [{ id }, { _id: id }] });
+    res.json({ ok: true, message: 'Search event deleted.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/delete-search-query', requireAdmin, async (req, res) => {
+  try {
+    const rawQ = String(req.body?.query || '').trim();
+    if (!rawQ) return fail(res, 400, 'Missing query parameter.');
+    const normQ = rawQ.toLowerCase().replace(/\s+/g, ' ').trim();
+    await analyticsCounters.deleteMany({
+      kind: 'search_query',
+      $or: [
+        { query: normQ },
+        { key: `search_query:${normQ}` },
+        { display_query: rawQ }
+      ]
+    });
+    const safeRegex = normQ.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    await analyticsEvents.deleteMany({
+      type: 'search',
+      query: { $regex: new RegExp(`^${safeRegex}$`, 'i') }
+    });
+    res.json({ ok: true, message: `Search query "${rawQ}" deleted.` });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/clear-all-searches', requireAdmin, async (req, res) => {
+  try {
+    const [eventsRes, countersRes] = await Promise.all([
+      analyticsEvents.deleteMany({ type: 'search' }),
+      analyticsCounters.deleteMany({ kind: 'search_query' })
+    ]);
+    res.json({
+      ok: true,
+      message: 'All search history and query logs cleared successfully.',
+      deletedEvents: eventsRes.deletedCount || 0,
+      deletedCounters: countersRes.deletedCount || 0
+    });
   } catch (error) {
     res.status(500).json(publicError(error));
   }
@@ -2115,8 +2178,17 @@ app.post('/api/admin/delete-message', requireAdmin, async (req, res) => {
   try {
     const id = String(req.body?.id || '').trim();
     if (!id) return fail(res, 400, 'Missing message id.');
-    await adminMessages.deleteOne({ id });
+    await adminMessages.deleteOne({ $or: [{ id }, { _id: id }] });
     res.json({ ok: true, message: 'Message removed.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/clear-all-admin-messages', requireAdmin, async (req, res) => {
+  try {
+    const result = await adminMessages.deleteMany({});
+    res.json({ ok: true, message: `Cleared ${result.deletedCount || 0} sent notifications and messages.`, count: result.deletedCount || 0 });
   } catch (error) {
     res.status(500).json(publicError(error));
   }
