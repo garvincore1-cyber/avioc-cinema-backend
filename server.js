@@ -197,12 +197,12 @@ async function ensureSchema() {
     shareReferrals.createIndex({ referrer_id: 1 }, { unique: true }),
     shareReferrals.createIndex({ visitors_count: -1 })
   ]);
-  // Expire any stale broadcast messages older than 30 minutes so visitors don't get unwanted automatic popups
+  // Expire any unread messages older than 1 hour as missed so users never see stale messages
   try {
-    const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000);
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
     await adminMessages.updateMany(
-      { target_type: 'all', status: 'unread', created_at: { $lt: thirtyMinsAgo } },
-      { $set: { status: 'expired', expired_at: new Date() } }
+      { status: 'unread', created_at: { $lt: oneHourAgo } },
+      { $set: { status: 'missed', updated_at: new Date() } }
     );
   } catch {}
   await backfillHistoricalAnalytics();
@@ -2299,29 +2299,38 @@ app.get('/api/messages/pending', async (req, res) => {
 
     if (!visitorId && !userId) return res.json(baseResponse);
 
-    const conditions = [];
-    if (visitorId) conditions.push({ target_id: visitorId, status: 'unread' });
-    if (userId) conditions.push({ target_id: userId, status: 'unread' });
+    // Messages expire after 1 hour (60 minutes); if not seen within 1 hour, considered missed
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
 
-    // Only deliver broadcasts created in the last 30 minutes that are still unread
-    const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000);
+    // Auto-mark any stale unread message older than 1 hour as missed
+    await adminMessages.updateMany(
+      { status: 'unread', created_at: { $lt: oneHourAgo } },
+      { $set: { status: 'missed', updated_at: new Date() } }
+    ).catch(() => {});
+
+    const conditions = [];
+    if (visitorId) conditions.push({ target_id: visitorId, status: 'unread', created_at: { $gte: oneHourAgo } });
+    if (userId) conditions.push({ target_id: userId, status: 'unread', created_at: { $gte: oneHourAgo } });
+
+    // Only deliver broadcasts created in the last 1 hour that are still unread
     conditions.push({
       target_type: 'all',
       status: 'unread',
-      created_at: { $gte: thirtyMinsAgo }
+      created_at: { $gte: oneHourAgo }
     });
 
     const list = await adminMessages.find({ $or: conditions }).sort({ created_at: -1 }).limit(15).toArray();
 
     const active = list.filter((m) => {
+      if (m.status !== 'unread') return false;
+      const ageMs = Date.now() - new Date(m.created_at).getTime();
+      if (ageMs > 60 * 60 * 1000) return false;
       if (m.target_type === 'all') {
-        if (m.status !== 'unread') return false;
         if (visitorId && Array.isArray(m.dismissed_ids) && m.dismissed_ids.includes(visitorId)) return false;
         if (visitorId && Array.isArray(m.replied_ids) && m.replied_ids.includes(visitorId)) return false;
-        if (new Date(m.created_at).getTime() < Date.now() - 30 * 60 * 1000) return false;
         return true;
       }
-      return m.status === 'unread';
+      return true;
     });
 
     res.json({
