@@ -1506,6 +1506,9 @@ app.post('/api/analytics/sync-browser', throttle({ windowMs: 60 * 1000, limit: 6
           movieId: m.movie_id || '',
           btnYes: m.btn_yes || 'Yes',
           btnNo: m.btn_no !== undefined ? m.btn_no : 'No',
+          offerPlan: m.offer_plan || (m.cta_type === 'payment' && /500/i.test(m.message || '') ? 'offer-500' : null),
+          offerPrice: m.offer_price || (m.offer_plan === 'offer-500' || /500/i.test(m.message || '') ? 500 : null),
+          offerDays: m.offer_days || 1,
           createdAt: m.created_at
         }));
     } catch {}
