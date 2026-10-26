@@ -47,6 +47,7 @@ let analyticsCounters;
 let userRequests;
 let adminMessages;
 let shareReferrals;
+let paywallHits;
 const liveSessions = new Map();
 const ADMIN_PIN = process.env.ADMIN_PIN || 'avioc2026';
 
@@ -174,6 +175,7 @@ async function ensureSchema() {
   userRequests = db.collection('user_requests');
   adminMessages = db.collection('admin_messages');
   shareReferrals = db.collection('share_referrals');
+  paywallHits = db.collection('paywall_hits');
   await Promise.all([
     users.createIndex({ email: 1 }, { unique: true }),
     users.createIndex({ verify_token_hash: 1 }, { sparse: true }),
@@ -1297,6 +1299,10 @@ app.post('/api/analytics/sync-browser', throttle({ windowMs: 60 * 1000, limit: 6
     const activity = String(body.activity || 'Browsing Home').slice(0, 140);
     const hasActivePass = Boolean(body.hasActivePass);
     const passMode = String(body.passMode || (hasActivePass ? 'VIP Pass' : '3h Free Trial')).slice(0, 40);
+    const openCount = Math.max(1, Number(body.openCount) || Number(body.visitCount) || 1);
+    const isAppOpen = Boolean(body.isAppOpen);
+    const hasHitPaywall = Boolean(body.hitPaywall || passMode.includes('Exhausted') || body.freeRemainingSec === 0);
+    const isPwa = Boolean(body.isPwa);
 
     // Register live session
     const prev = liveSessions.get(visitorId);
@@ -1441,33 +1447,93 @@ app.post('/api/analytics/sync-browser', throttle({ windowMs: 60 * 1000, limit: 6
     }
 
     const totalVisWatch = Math.max(existingVisitor?.watch_seconds || 0, watchSecondsUsed, newlyAddedWatchSec);
+    const visSetObj = {
+      last_seen: now,
+      device_type: uaInfo.deviceType,
+      os: uaInfo.os,
+      browser: uaInfo.browser,
+      is_pwa: isPwa || Boolean(existingVisitor?.is_pwa),
+      pass_mode: passMode,
+      has_active_pass: hasActivePass,
+      current_activity: activity,
+      watch_seconds: totalVisWatch,
+      open_count: Math.max(existingVisitor?.open_count || 1, openCount),
+      synced_item_ids: newSyncedIds.slice(-300),
+      ...(user?.id ? { user_id: user.id } : {}),
+      ...(user?.email ? { user_email: user.email } : {}),
+      ...(user?.displayName ? { user_name: user.displayName } : {})
+    };
+    if (hasHitPaywall) {
+      visSetObj.last_paywall_hit = now;
+      visSetObj.paywall_item = body.itemTitle || body.itemId || 'VIP Pass Prompt';
+    }
+    const visIncObj = {};
+    if (isAppOpen) {
+      visIncObj.visit_count = 1;
+      visIncObj.open_count = 1;
+    }
+
     await visitors.updateOne(
       { visitor_id: visitorId },
       {
-        $set: {
-          last_seen: now,
-          device_type: uaInfo.deviceType,
-          os: uaInfo.os,
-          browser: uaInfo.browser,
-          is_pwa: Boolean(body.isPwa),
-          pass_mode: passMode,
-          has_active_pass: hasActivePass,
-          current_activity: activity,
-          watch_seconds: totalVisWatch,
-          synced_item_ids: newSyncedIds.slice(-300),
-          ...(user?.id ? { user_id: user.id } : {}),
-          ...(user?.email ? { user_email: user.email } : {}),
-          ...(user?.displayName ? { user_name: user.displayName } : {})
-        },
+        $set: visSetObj,
+        ...(Object.keys(visIncObj).length ? { $inc: visIncObj } : {}),
         $setOnInsert: {
           visitor_id: visitorId,
-          first_seen: now,
+          first_seen: body.firstOpenDate ? new Date(body.firstOpenDate) : now,
           visit_count: 1,
+          open_count: openCount,
           referrer: 'Direct'
         }
       },
       { upsert: true }
     );
+
+    if (user?.id) {
+      const userUpdateSet = {
+        last_seen: now,
+        updated_at: now,
+        ...(hasHitPaywall ? { last_paywall_hit: now, paywall_item: body.itemTitle || 'VIP Pass Prompt' } : {}),
+        ...(isPwa ? { is_pwa: true, installed_at: now } : {})
+      };
+      users.updateOne(
+        { id: user.id },
+        {
+          $set: userUpdateSet,
+          $max: { open_count: openCount },
+          ...(isAppOpen ? { $inc: { visit_count: 1, open_count: 1 } } : {})
+        }
+      ).catch(() => {});
+    }
+
+    if (hasHitPaywall) {
+      paywallHits.updateOne(
+        { visitor_id: visitorId, hit_at: { $gte: new Date(Date.now() - 30 * 60 * 1000) } },
+        {
+          $setOnInsert: {
+            visitor_id: visitorId,
+            user_id: user?.id || null,
+            user_email: user?.email || null,
+            user_name: user?.displayName || (user?.email ? user.email.split('@')[0] : 'Guest Visitor'),
+            item_id: body.itemId || null,
+            item_title: body.itemTitle || 'VIP Pass Prompt',
+            item_type: body.itemType || 'film',
+            vj: body.vj || null,
+            device_type: uaInfo.deviceType,
+            os: uaInfo.os,
+            browser: uaInfo.browser,
+            is_pwa: isPwa,
+            watch_seconds: totalVisWatch,
+            open_count: openCount,
+            first_seen: existingVisitor?.first_seen || (body.firstOpenDate ? new Date(body.firstOpenDate) : now),
+            hit_at: now,
+            status: 'pending_offer',
+            created_at: now
+          }
+        },
+        { upsert: true }
+      ).catch(() => {});
+    }
 
     if (newlyAddedPlays > 0 || newlyAddedWatchSec > 0) {
       await analyticsCounters.updateOne(
@@ -1550,7 +1616,9 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       allUserRequests,
       allAdminMessages,
       allRecentSearches,
-      allShareReferrals
+      allShareReferrals,
+      allPaywallHits,
+      allInstalledVisitors
     ] = await Promise.all([
       visitors.countDocuments(),
       visitors.countDocuments({ last_seen: { $gte: startOfToday } }),
@@ -1573,7 +1641,9 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       userRequests.find({}).sort({ created_at: -1 }).limit(200).toArray(),
       adminMessages.find({}).sort({ created_at: -1 }).limit(100).toArray(),
       analyticsEvents.find({ type: 'search' }).sort({ created_at: -1 }).limit(100).toArray(),
-      shareReferrals.find({}).sort({ visitors_count: -1, last_visit_at: -1 }).limit(100).toArray()
+      shareReferrals.find({}).sort({ visitors_count: -1, last_visit_at: -1 }).limit(100).toArray(),
+      paywallHits.find({}).sort({ hit_at: -1 }).limit(120).toArray(),
+      visitors.find({ is_pwa: true }).sort({ last_seen: -1 }).limit(120).toArray()
     ]);
 
     // Merge in-memory liveSessions with DB liveVisitorDocs
@@ -1707,6 +1777,13 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
         hasActivePass: isActivePass,
         remainingHours,
         grantedByAdmin: Boolean(sub?.granted_by_admin),
+        openCount: u.open_count || vis?.open_count || vis?.visit_count || u.visit_count || 1,
+        firstSeen: u.first_seen || vis?.first_seen || u.created_at,
+        isPwa: Boolean(u.is_pwa || vis?.is_pwa),
+        installedAt: u.installed_at || vis?.installed_at || null,
+        lastPaywallHit: u.last_paywall_hit || vis?.last_paywall_hit || null,
+        paywallItem: u.paywall_item || vis?.paywall_item || null,
+        paywallHitsCount: u.paywall_hits_count || vis?.paywall_hits_count || 0,
         lastPlanId: lastSuccess?.plan_id || sub?.plan_id || payInfo?.lastPayment?.plan_id || null,
         lastPaymentMethod: lastSuccess?.payment_method || payInfo?.lastPayment?.payment_method || (sub?.granted_by_admin ? 'admin_grant' : null),
         lastNetwork: lastSuccess?.network || payInfo?.lastPayment?.network || null,
@@ -1849,8 +1926,71 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
           hasActiveVip
         };
       }),
-      recentVisitors: recentVisitors.slice(0, 100),
-      recentActivity: recentEvents.slice(0, 80)
+      recentVisitors: recentVisitors.slice(0, 100).map(v => ({
+        ...v,
+        open_count: v.open_count || v.visit_count || 1,
+        first_seen: v.first_seen || v.created_at
+      })),
+      recentActivity: recentEvents.slice(0, 80),
+      paywallHits: (allPaywallHits || []).map(h => {
+        const u = h.user_id ? allUsers.find(user => user.id === h.user_id) : null;
+        const sub = h.user_id ? subByUser.get(h.user_id) : null;
+        const expiresAt = sub?.expires_at ? new Date(sub.expires_at) : null;
+        const hasActivePass = Boolean(expiresAt && expiresAt > now);
+        const pay = (h.user_id ? paymentsByUser.get(h.user_id) : null);
+        const vis = visitorByUser.get(h.user_id) || (h.visitor_id ? recentVisitors.find(v => v.visitor_id === h.visitor_id) : null);
+        return {
+          id: String(h._id || h.id || ''),
+          visitorId: h.visitor_id,
+          userId: h.user_id || null,
+          userEmail: h.user_email || u?.email || null,
+          userName: h.user_name || u?.display_name || (h.user_email ? h.user_email.split('@')[0] : 'Guest Viewer'),
+          phone: pay?.lastSuccessPayment?.phone_number || pay?.lastPayment?.phone_number || null,
+          itemId: h.item_id || null,
+          itemTitle: h.item_title || 'VIP Pass Prompt',
+          itemType: h.item_type || 'film',
+          vj: h.vj || null,
+          deviceType: h.device_type || 'Mobile',
+          os: h.os || 'Android',
+          browser: h.browser || 'Chrome',
+          isPwa: Boolean(h.is_pwa || vis?.is_pwa),
+          watchSeconds: h.watch_seconds || vis?.watch_seconds || 0,
+          openCount: h.open_count || vis?.open_count || vis?.visit_count || u?.open_count || 1,
+          firstSeen: h.first_seen || vis?.first_seen || u?.created_at || h.hit_at,
+          hitAt: h.hit_at || h.created_at,
+          hasActivePass
+        };
+      }),
+      installedUsers: (allInstalledVisitors || []).map(v => {
+        const u = v.user_id ? allUsers.find(user => user.id === v.user_id) : null;
+        const sub = v.user_id ? subByUser.get(v.user_id) : null;
+        const expiresAt = sub?.expires_at ? new Date(sub.expires_at) : null;
+        const hasActivePass = Boolean(expiresAt && expiresAt > now);
+        const pay = v.user_id ? paymentsByUser.get(v.user_id) : null;
+        return {
+          visitorId: v.visitor_id,
+          userId: v.user_id || null,
+          userEmail: v.user_email || u?.email || null,
+          userName: v.user_name || u?.display_name || (v.user_email ? v.user_email.split('@')[0] : 'Installed Device'),
+          phone: pay?.lastSuccessPayment?.phone_number || pay?.lastPayment?.phone_number || null,
+          deviceType: v.device_type || 'Mobile',
+          os: v.os || 'Android',
+          browser: v.browser || 'Chrome',
+          isPwa: true,
+          installedAt: v.installed_at || v.last_seen || v.first_seen,
+          firstSeen: v.first_seen || v.created_at,
+          lastSeen: v.last_seen,
+          openCount: v.open_count || v.visit_count || 1,
+          watchSeconds: v.watch_seconds || 0,
+          passMode: v.pass_mode || (hasActivePass ? 'VIP Pass' : '3h Free Trial'),
+          hasActivePass
+        };
+      }),
+      overview: {
+        ...overview,
+        totalPaywallHits: (allPaywallHits || []).length,
+        totalAppInstalls: (allInstalledVisitors || []).length
+      }
     });
   } catch (error) {
     res.status(500).json(publicError(error));
