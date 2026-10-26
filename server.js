@@ -450,6 +450,7 @@ app.post('/api/auth/login', throttle({ limit: 15 }), async (req, res) => {
   try {
     const user = await users.findOne({ email });
     if (!user || !verifyPassword(password, user.password_hash)) return fail(res, 401, 'Email or password is incorrect.');
+    if (user.removed_by_admin) return fail(res, 403, 'Your account has been removed by an administrator. Please contact support.');
     if (!user.email_verified_at && (process.env.RESEND_API_KEY && process.env.EMAIL_FROM)) return fail(res, 403, 'Verify your email before signing in.');
     const subscription = await subscriptions.findOne({ user_id: user.id });
     users.updateOne({ id: user.id }, { $set: { last_login_at: new Date(), updated_at: new Date() } }).catch(() => {});
@@ -509,6 +510,10 @@ app.post('/api/auth/google', throttle({ limit: 30 }), async (req, res) => {
 
     const now = new Date();
     let user = await users.findOne({ email });
+
+    if (user && user.removed_by_admin) {
+      return fail(res, 403, 'Your account has been removed by an administrator. Please contact support.');
+    }
 
     if (!user) {
       const id = crypto.randomUUID();
@@ -1750,7 +1755,10 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
     let newMembers7d = 0;
     let verifiedMembers = 0;
 
-    const members = allUsers.map((u) => {
+    const activeUsers = allUsers.filter((u) => !u.removed_by_admin);
+    const removedUsers = allUsers.filter((u) => Boolean(u.removed_by_admin));
+
+    const members = activeUsers.map((u) => {
       const sub = subByUser.get(u.id);
       const payInfo = paymentsByUser.get(u.id);
       const vis = visitorByUser.get(u.id);
@@ -1804,6 +1812,28 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
     });
 
     const paidMembers = members.filter((m) => m.hasActivePass || m.successPaymentsCount > 0 || m.subscriptionExpiresAt);
+
+    const removedMembers = removedUsers.map((u) => {
+      const payInfo = paymentsByUser.get(u.id);
+      const vis = visitorByUser.get(u.id);
+      return {
+        id: u.id,
+        email: u.email,
+        displayName: u.display_name || u.email.split('@')[0],
+        avatar: u.avatar || null,
+        verified: Boolean(u.email_verified_at),
+        createdAt: u.created_at,
+        removedAt: u.removed_at || u.updated_at,
+        removedReason: u.removed_reason || 'Removed by admin',
+        lastLoginAt: u.last_login_at || vis?.last_seen || null,
+        totalPaidUgx: payInfo?.totalPaidUgx || 0,
+        totalPaidUsd: payInfo?.totalPaidUsd || 0,
+        successPaymentsCount: payInfo?.successCount || 0,
+        lastPhone: payInfo?.lastPayment?.phone_number || null,
+        deviceType: vis?.device_type || null,
+        os: vis?.os || null
+      };
+    });
 
     // Aggregate totals from counters
     let totalVisits = 0;
@@ -1868,7 +1898,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
         totalShareOpens,
         totalSearches,
         zeroResultSearchesCount: zeroResultSearches.length,
-        totalMembers: allUsers.length,
+        totalMembers: activeUsers.length,
+        totalRemovedMembers: removedMembers.length,
         verifiedMembers,
         newMembersToday,
         newMembers7d,
@@ -1910,6 +1941,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
         streamErrors
       },
       members,
+      removedMembers,
       paidMembers,
       payments: allPayments.slice(0, 150),
       userRequests: allUserRequests,
@@ -2618,6 +2650,58 @@ app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
   try {
     const userId = String(req.body?.userId || '').trim();
     if (!userId) return fail(res, 400, 'Missing userId.');
+    const now = new Date();
+    const result = await users.updateOne(
+      { id: userId },
+      {
+        $set: {
+          removed_by_admin: true,
+          removed_at: now,
+          removed_reason: req.body?.reason || 'Removed by administrator',
+          updated_at: now
+        }
+      }
+    );
+    if (!result.matchedCount) return fail(res, 404, 'Member not found.');
+    for (const [k, v] of liveSessions) {
+      if (v.userId === userId || k === `member_${userId}`) liveSessions.delete(k);
+    }
+    res.json({ message: 'Member account moved to Removed Members.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/restore-user', requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!userId) return fail(res, 400, 'Missing userId.');
+    const now = new Date();
+    const result = await users.updateOne(
+      { id: userId },
+      {
+        $set: {
+          removed_by_admin: false,
+          restored_at: now,
+          updated_at: now
+        },
+        $unset: {
+          removed_at: '',
+          removed_reason: ''
+        }
+      }
+    );
+    if (!result.matchedCount) return fail(res, 404, 'Member not found.');
+    res.json({ message: 'Member restored and put back successfully.' });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/purge-user', requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!userId) return fail(res, 400, 'Missing userId.');
     await Promise.all([
       users.deleteOne({ id: userId }),
       subscriptions.deleteOne({ user_id: userId }),
@@ -2626,7 +2710,7 @@ app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
     for (const [k, v] of liveSessions) {
       if (v.userId === userId || k === `member_${userId}`) liveSessions.delete(k);
     }
-    res.json({ message: 'Member account removed.' });
+    res.json({ message: 'Member account permanently deleted.' });
   } catch (error) {
     res.status(500).json(publicError(error));
   }
