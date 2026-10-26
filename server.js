@@ -623,7 +623,8 @@ app.post('/api/auth/change-password', userOnly, throttle({ limit: 10 }), async (
     );
     res.json({ message: 'Password updated successfully!' });
   } catch (error) {
-    res.status(500).json(publicError(error));
+    console.error('DASHBOARD ERROR:', error.stack || error.message);
+    res.status(500).json({ error: error.message || 'Dashboard failed' });
   }
 });
 
@@ -1882,7 +1883,9 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
         totalPaymentsPending,
         totalPaymentsFailed,
         paywallHits: counterPaywallHits,
-        pwaInstalls
+        pwaInstalls,
+        totalPaywallHits: (allPaywallHits || []).length,
+        totalAppInstalls: (allInstalledVisitors || []).length
       },
       dailySeries: dailyCounters.slice(0, 14).reverse(),
       breakdown: {
@@ -1987,11 +1990,6 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
           hasActivePass
         };
       }),
-      overview: {
-        ...overview,
-        totalPaywallHits: (allPaywallHits || []).length,
-        totalAppInstalls: (allInstalledVisitors || []).length
-      }
     });
   } catch (error) {
     res.status(500).json(publicError(error));
