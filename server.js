@@ -47,7 +47,7 @@ let analyticsCounters;
 let userRequests;
 let adminMessages;
 let shareReferrals;
-let paywallHits;
+let paywallHitsCol;
 const liveSessions = new Map();
 const ADMIN_PIN = process.env.ADMIN_PIN || 'avioc2026';
 
@@ -175,7 +175,7 @@ async function ensureSchema() {
   userRequests = db.collection('user_requests');
   adminMessages = db.collection('admin_messages');
   shareReferrals = db.collection('share_referrals');
-  paywallHits = db.collection('paywall_hits');
+  paywallHitsCol = db.collection('paywall_hits');
   await Promise.all([
     users.createIndex({ email: 1 }, { unique: true }),
     users.createIndex({ verify_token_hash: 1 }, { sparse: true }),
@@ -547,7 +547,8 @@ app.post('/api/auth/google', throttle({ limit: 30 }), async (req, res) => {
       subscriptionExpiresAt: subscription?.expires_at || null
     });
   } catch (error) {
-    res.status(500).json(publicError(error));
+    console.error('DASHBOARD ERROR:', error.stack || error.message);
+    res.status(500).json({ error: error.message || 'Dashboard failed' });
   }
 });
 
@@ -1507,7 +1508,7 @@ app.post('/api/analytics/sync-browser', throttle({ windowMs: 60 * 1000, limit: 6
     }
 
     if (hasHitPaywall) {
-      paywallHits.updateOne(
+      paywallHitsCol.updateOne(
         { visitor_id: visitorId, hit_at: { $gte: new Date(Date.now() - 30 * 60 * 1000) } },
         {
           $setOnInsert: {
@@ -1642,8 +1643,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       adminMessages.find({}).sort({ created_at: -1 }).limit(100).toArray(),
       analyticsEvents.find({ type: 'search' }).sort({ created_at: -1 }).limit(100).toArray(),
       shareReferrals.find({}).sort({ visitors_count: -1, last_visit_at: -1 }).limit(100).toArray(),
-      paywallHits.find({}).sort({ hit_at: -1 }).limit(120).toArray(),
-      visitors.find({ is_pwa: true }).sort({ last_seen: -1 }).limit(120).toArray()
+      paywallHitsCol.find({}).sort({ hit_at: -1 }).limit(120).toArray(),
+      visitors.find({ $or: [{ is_pwa: true }, { is_pwa: 'true' }, { pwa_installs: { $gt: 0 } }] }).sort({ last_seen: -1 }).limit(120).toArray()
     ]);
 
     // Merge in-memory liveSessions with DB liveVisitorDocs
@@ -1810,7 +1811,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
     let totalShareOpens = 0;
     let totalSearches = 0;
     let totalPlays = 0;
-    let paywallHits = 0;
+    let counterPaywallHits = 0;
     let pwaInstalls = 0;
 
     for (const d of dailyCounters) {
@@ -1820,7 +1821,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       totalShareOpens += Number(d.share_opens) || 0;
       totalSearches += Number(d.searches) || 0;
       totalPlays += Number(d.plays) || 0;
-      paywallHits += Number(d.paywall_hits) || 0;
+      counterPaywallHits += Number(d.paywall_hits) || 0;
       pwaInstalls += Number(d.pwa_installs) || 0;
     }
 
@@ -1880,7 +1881,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
         totalPaymentsSuccess,
         totalPaymentsPending,
         totalPaymentsFailed,
-        paywallHits,
+        paywallHits: counterPaywallHits,
         pwaInstalls
       },
       dailySeries: dailyCounters.slice(0, 14).reverse(),
