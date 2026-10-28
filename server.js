@@ -240,7 +240,7 @@ async function backfillHistoricalAnalytics() {
             os: userPay?.phone_number ? 'Android' : 'Windows',
             browser: 'Chrome',
             is_pwa: false,
-            pass_mode: hasActive ? 'VIP Pass' : '3h Free Trial',
+            pass_mode: hasActive ? 'VIP Pass' : '10s Free Preview',
             has_active_pass: hasActive,
             current_activity: 'Signed-In Member',
             visit_count: 1,
@@ -303,7 +303,7 @@ async function trackRequestVisitor(req, activity = 'Browsing Home', userObj = nu
       os: prev?.os || uaInfo.os,
       browser: prev?.browser || uaInfo.browser,
       isPwa: Boolean(prev?.isPwa),
-      passMode: hasActivePass ? 'VIP Pass' : (prev?.passMode || '3h Free Trial'),
+      passMode: hasActivePass ? 'VIP Pass' : (prev?.passMode || '10s Free Preview'),
       hasActivePass: hasActivePass || Boolean(prev?.hasActivePass),
       freeRemainingSec: prev?.freeRemainingSec ?? null,
       activity: prev?.activity && prev.activity !== 'Browsing Home' ? prev.activity : activity,
@@ -337,7 +337,7 @@ async function trackRequestVisitor(req, activity = 'Browsing Home', userObj = nu
           visitor_id: visitorId,
           first_seen: now,
           current_activity: activity,
-          pass_mode: hasActivePass ? 'VIP Pass' : '3h Free Trial',
+          pass_mode: hasActivePass ? 'VIP Pass' : '10s Free Preview',
           has_active_pass: hasActivePass,
           visit_count: 1,
           watch_seconds: 0,
@@ -1008,7 +1008,7 @@ app.post('/api/analytics/event', throttle({ windowMs: 60 * 1000, limit: 180 }), 
     const userId = body.userId ? String(body.userId).slice(0, 80) : null;
     const userEmail = body.userEmail ? String(body.userEmail).trim().toLowerCase().slice(0, 200) : null;
     const userName = body.userName ? String(body.userName).trim().slice(0, 80) : null;
-    const passMode = String(body.passMode || '3h Free Trial').slice(0, 40);
+    const passMode = String(body.passMode || '10s Free Preview').slice(0, 40);
     const hasActivePass = Boolean(body.hasActivePass);
     const freeRemainingSec = Number.isFinite(Number(body.freeRemainingSec)) ? Number(body.freeRemainingSec) : null;
 
@@ -1308,7 +1308,7 @@ app.post('/api/analytics/sync-browser', throttle({ windowMs: 60 * 1000, limit: 6
     const watchSecondsUsed = Math.max(0, Number(body.watchSecondsUsed) || 0);
     const activity = String(body.activity || 'Browsing Home').slice(0, 140);
     const hasActivePass = Boolean(body.hasActivePass);
-    const passMode = String(body.passMode || (hasActivePass ? 'VIP Pass' : '3h Free Trial')).slice(0, 40);
+    const passMode = String(body.passMode || (hasActivePass ? 'VIP Pass' : '10s Free Preview')).slice(0, 40);
     const openCount = Math.max(1, Number(body.openCount) || Number(body.visitCount) || 1);
     const isAppOpen = Boolean(body.isAppOpen);
     const hasHitPaywall = Boolean(body.hitPaywall || passMode.includes('Exhausted') || body.freeRemainingSec === 0);
@@ -1668,7 +1668,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
         os: doc.os || 'Other',
         browser: doc.browser || 'Browser',
         isPwa: Boolean(doc.is_pwa),
-        passMode: doc.pass_mode || '3h Free Trial',
+        passMode: doc.pass_mode || '10s Free Preview',
         hasActivePass: Boolean(doc.has_active_pass),
         freeRemainingSec: doc.free_remaining_sec ?? null,
         activity: doc.current_activity || 'Browsing Home',
@@ -1865,16 +1865,15 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
     // Device & OS & Pass funnel breakdown from recentVisitors
     const deviceBreakdown = { Mobile: 0, 'Smart TV': 0, Desktop: 0, Tablet: 0 };
     const osBreakdown = {};
-    const passFunnel = { 'VIP Pass': 0, '3h Free Trial': 0, '30m Daily Free': 0, 'Trial Ended': 0 };
+    const passFunnel = { 'VIP Pass': 0, '10s Free Preview': 0, 'Trial Ended': 0 };
     for (const v of recentVisitors) {
       const dt = v.device_type || 'Desktop';
       deviceBreakdown[dt] = (deviceBreakdown[dt] || 0) + 1;
       const o = v.os || 'Other';
       osBreakdown[o] = (osBreakdown[o] || 0) + 1;
       if (v.has_active_pass) passFunnel['VIP Pass']++;
-      else if (String(v.pass_mode || '').includes('daily')) passFunnel['30m Daily Free']++;
       else if (String(v.pass_mode || '').includes('exhausted') || (v.free_remaining_sec !== undefined && v.free_remaining_sec !== null && v.free_remaining_sec <= 0)) passFunnel['Trial Ended']++;
-      else passFunnel['3h Free Trial']++;
+      else passFunnel['10s Free Preview']++;
     }
 
     const recentShares = recentEvents.filter((e) => e.type === 'share' || e.type === 'share_open').slice(0, 40);
@@ -2025,7 +2024,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
           lastSeen: v.last_seen,
           openCount: v.open_count || v.visit_count || 1,
           watchSeconds: v.watch_seconds || 0,
-          passMode: v.pass_mode || (hasActivePass ? 'VIP Pass' : '3h Free Trial'),
+          passMode: v.pass_mode || (hasActivePass ? 'VIP Pass' : '10s Free Preview'),
           hasActivePass
         };
       }),
