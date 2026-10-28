@@ -1630,7 +1630,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       allRecentSearches,
       allShareReferrals,
       allPaywallHits,
-      allInstalledVisitors
+      allInstalledVisitors,
+      allCommunityMessages
     ] = await Promise.all([
       visitors.countDocuments(),
       visitors.countDocuments({ last_seen: { $gte: startOfToday } }),
@@ -1655,7 +1656,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       analyticsEvents.find({ type: 'search' }).sort({ created_at: -1 }).limit(500).toArray(),
       shareReferrals.find({}).sort({ visitors_count: -1, last_visit_at: -1 }).limit(100).toArray(),
       paywallHitsCol.find({}).sort({ hit_at: -1 }).limit(300).toArray(),
-      visitors.find({ $or: [{ is_pwa: true }, { is_pwa: 'true' }, { pwa_installs: { $gt: 0 } }] }).sort({ last_seen: -1 }).limit(1000).toArray()
+      visitors.find({ $or: [{ is_pwa: true }, { is_pwa: 'true' }, { pwa_installs: { $gt: 0 } }] }).sort({ last_seen: -1 }).limit(1000).toArray(),
+      communityMessages ? communityMessages.find({}).sort({ created_at: -1 }).limit(200).toArray() : Promise.resolve([])
     ]);
 
     // Merge in-memory liveSessions with DB liveVisitorDocs
@@ -1954,6 +1956,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       payments: allPayments.slice(0, 150),
       userRequests: allUserRequests,
       adminMessages: allAdminMessages,
+      communityMessages: allCommunityMessages || [],
       topReferrers: (allShareReferrals || []).map((r) => {
         const sub = (allSubscriptions || []).find((s) => s.user_id === r.referrer_uid);
         const hasActiveVip = sub && sub.expires_at ? new Date(sub.expires_at) > now : false;
@@ -2195,7 +2198,12 @@ app.post('/api/admin/request-status', requireAdmin, async (req, res) => {
     const id = String(req.body?.id || '').trim();
     const status = String(req.body?.status || 'done').trim();
     if (!id) return fail(res, 400, 'Missing request id.');
-    await userRequests.updateOne({ id }, { $set: { status, updated_at: new Date() } });
+    if (userRequests) {
+      await userRequests.updateOne({ $or: [{ id }, { _id: id }] }, { $set: { status, updated_at: new Date() } });
+    }
+    if (communityMessages) {
+      await communityMessages.updateOne({ $or: [{ id }, { _id: id }] }, { $set: { status, updated_at: new Date() } });
+    }
     res.json({ ok: true, message: `Request marked as ${status}.` });
   } catch (error) {
     res.status(500).json(publicError(error));
@@ -2206,7 +2214,12 @@ app.post('/api/admin/delete-request', requireAdmin, async (req, res) => {
   try {
     const id = String(req.body?.id || '').trim();
     if (!id) return fail(res, 400, 'Missing request id.');
-    await userRequests.deleteOne({ $or: [{ id }, { _id: id }] });
+    if (userRequests) {
+      await userRequests.deleteOne({ $or: [{ id }, { _id: id }] });
+    }
+    if (communityMessages) {
+      await communityMessages.deleteOne({ $or: [{ id }, { _id: id }] });
+    }
     res.json({ ok: true, message: 'Request removed.' });
   } catch (error) {
     res.status(500).json(publicError(error));
@@ -2217,8 +2230,33 @@ app.post('/api/admin/clear-requests', requireAdmin, async (req, res) => {
   try {
     const kind = String(req.body?.kind || 'all').trim();
     const filter = kind === 'all' ? {} : (kind === 'message' ? { kind: 'message' } : { kind: { $ne: 'message' } });
-    const result = await userRequests.deleteMany(filter);
-    res.json({ ok: true, message: `Cleared ${result.deletedCount || 0} user requests/messages.`, count: result.deletedCount || 0 });
+    let totalDeleted = 0;
+    if (userRequests) {
+      const result = await userRequests.deleteMany(filter);
+      totalDeleted += result.deletedCount || 0;
+    }
+    if (communityMessages && kind === 'all') {
+      const result = await communityMessages.deleteMany({});
+      totalDeleted += result.deletedCount || 0;
+    }
+    res.json({ ok: true, message: `Cleared ${totalDeleted} user requests/messages.`, count: totalDeleted });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/admin/clear-uploaded-requests', requireAdmin, async (req, res) => {
+  try {
+    let count = 0;
+    if (communityMessages) {
+      const r1 = await communityMessages.deleteMany({ status: { $in: ['Uploaded', 'uploaded', 'done', 'Ready'] } });
+      count += r1.deletedCount || 0;
+    }
+    if (userRequests) {
+      const r2 = await userRequests.deleteMany({ status: { $in: ['Uploaded', 'uploaded', 'done', 'Ready'] } });
+      count += r2.deletedCount || 0;
+    }
+    res.json({ ok: true, message: `Cleared ${count} uploaded items.`, count });
   } catch (error) {
     res.status(500).json(publicError(error));
   }
@@ -2315,8 +2353,14 @@ app.post('/api/community/messages/:id/reply', throttle({ windowMs: 60 * 1000, li
       created_at: now
     };
 
+    const status = b.status ? String(b.status).trim() : null;
     if (communityMessages) {
-      await communityMessages.updateOne({ id }, { $push: { replies: replyObj } });
+      const updateFields = { $push: { replies: replyObj } };
+      if (status) updateFields.$set = { status, updated_at: now };
+      await communityMessages.updateOne({ $or: [{ id }, { _id: id }] }, updateFields);
+    }
+    if (status && userRequests) {
+      await userRequests.updateOne({ $or: [{ id }, { _id: id }] }, { $set: { status, updated_at: now } }).catch(() => {});
     }
 
     res.json({ ok: true, reply: replyObj });
