@@ -48,6 +48,7 @@ let userRequests;
 let adminMessages;
 let shareReferrals;
 let paywallHitsCol;
+let communityMessages;
 const liveSessions = new Map();
 const ADMIN_PIN = process.env.ADMIN_PIN || 'avioc2026';
 
@@ -176,6 +177,7 @@ async function ensureSchema() {
   adminMessages = db.collection('admin_messages');
   shareReferrals = db.collection('share_referrals');
   paywallHitsCol = db.collection('paywall_hits');
+  communityMessages = db.collection('community_messages');
   await Promise.all([
     users.createIndex({ email: 1 }, { unique: true }),
     users.createIndex({ verify_token_hash: 1 }, { sparse: true }),
@@ -2217,6 +2219,120 @@ app.post('/api/admin/clear-requests', requireAdmin, async (req, res) => {
     const filter = kind === 'all' ? {} : (kind === 'message' ? { kind: 'message' } : { kind: { $ne: 'message' } });
     const result = await userRequests.deleteMany(filter);
     res.json({ ok: true, message: `Cleared ${result.deletedCount || 0} user requests/messages.`, count: result.deletedCount || 0 });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+// Community Messages & Movie Requests Endpoints
+app.get('/api/community/messages', async (req, res) => {
+  try {
+    if (!communityMessages) {
+      return res.json({ ok: true, messages: [] });
+    }
+    const msgs = await communityMessages.find({}).sort({ created_at: -1 }).limit(60).toArray();
+    res.json({ ok: true, messages: msgs.reverse() });
+  } catch (error) {
+    res.json({ ok: true, messages: [] });
+  }
+});
+
+app.post('/api/community/messages', throttle({ windowMs: 60 * 1000, limit: 30 }), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const text = String(b.text || '').trim().slice(0, 800);
+    const movieTitle = String(b.movieTitle || '').trim().slice(0, 150);
+    const type = b.type || (movieTitle ? 'request' : 'chat');
+    const sender = String(b.sender || 'Community Member').trim().slice(0, 60);
+    const senderColor = String(b.senderColor || '#00a884').trim().slice(0, 20);
+    const vj = String(b.vj || '').trim().slice(0, 80);
+    const poster = String(b.poster || '').trim().slice(0, 500);
+    const category = String(b.category || 'Movie').trim().slice(0, 50);
+    const itemId = String(b.itemId || '').trim().slice(0, 80);
+    const now = new Date();
+    const id = b.id || `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    const doc = {
+      id,
+      type,
+      sender,
+      senderColor,
+      movieTitle: movieTitle || null,
+      vj: vj || null,
+      poster: poster || null,
+      category: category || null,
+      itemId: itemId || null,
+      status: type === 'request' ? 'Pending' : null,
+      text: text || (type === 'request' ? `Requested "${movieTitle}" for Avioc Cinema.` : ''),
+      time: timeStr,
+      created_at: now,
+      upvotes: 1,
+      replies: []
+    };
+
+    if (communityMessages) {
+      await communityMessages.insertOne(doc);
+    }
+
+    if (userRequests) {
+      userRequests.insertOne({
+        id: crypto.randomUUID(),
+        kind: type === 'request' ? 'movie' : 'message',
+        text: type === 'request' ? (movieTitle + (vj ? ` (${vj})` : '')) : text,
+        vj: vj || null,
+        user_name: sender.replace(/^~\s*/, ''),
+        status: 'open',
+        created_at: now,
+        updated_at: now
+      }).catch(() => {});
+    }
+
+    res.status(201).json({ ok: true, message: doc });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/community/messages/:id/reply', throttle({ windowMs: 60 * 1000, limit: 30 }), async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const b = req.body || {};
+    const text = String(b.text || '').trim().slice(0, 600);
+    if (!text) return fail(res, 400, 'Reply text is required');
+    const sender = String(b.sender || 'Community Member').trim().slice(0, 60);
+    const senderColor = String(b.senderColor || '#00a884').trim().slice(0, 20);
+    const isAdmin = Boolean(b.isAdmin);
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const replyObj = {
+      id: `rep-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      sender,
+      senderColor,
+      isAdmin,
+      text,
+      time: timeStr,
+      created_at: now
+    };
+
+    if (communityMessages) {
+      await communityMessages.updateOne({ id }, { $push: { replies: replyObj } });
+    }
+
+    res.json({ ok: true, reply: replyObj });
+  } catch (error) {
+    res.status(500).json(publicError(error));
+  }
+});
+
+app.post('/api/community/messages/:id/upvote', async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const increment = req.body?.remove ? -1 : 1;
+    if (communityMessages) {
+      await communityMessages.updateOne({ id }, { $inc: { upvotes: increment } });
+    }
+    res.json({ ok: true });
   } catch (error) {
     res.status(500).json(publicError(error));
   }
