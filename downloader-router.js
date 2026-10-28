@@ -8,7 +8,8 @@ const router = express.Router();
 const DOWNLOADER_PUBLIC_DIR = path.join(__dirname, 'public', 'downloader');
 const DOWNLOADER_ENGINE_URL = (process.env.DOWNLOADER_ENGINE_URL || '').replace(/\/+$/, '');
 
-// In-memory stores for Render instance
+// In-memory caches and stores
+const exploreCache = new Map();
 const memoryDownloads = new Map();
 const memoryPlaylists = [
   {
@@ -16,48 +17,126 @@ const memoryPlaylists = [
     name: 'Uganda & East Africa Hits 2026',
     created_at: new Date().toISOString(),
     items: [
-      { id: 'item-1', title: 'Eddy Kenzo - 5G', duration: '3:45', thumbnail: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400' },
-      { id: 'item-2', title: 'Sheebah - Sipimuka', duration: '4:10', thumbnail: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=400' }
+      { id: '6B00VKKv0u8', title: 'Eddy Kenzo - 5G', duration: '3:02', thumbnail: 'https://i.ytimg.com/vi/6B00VKKv0u8/hqdefault.jpg' },
+      { id: 'WKERHnuc4yo', title: 'Ayra Starr - Heaven Baby', duration: '3:12', thumbnail: 'https://i.ytimg.com/vi/WKERHnuc4yo/hqdefault.jpg' }
     ]
   }
 ];
 const memorySearchHistory = [
   'Eddy Kenzo',
   'Ayra Starr',
+  'Sheebah',
   'Action Movies 2026',
   'Luganda Translated Movies',
-  'Afrobeats Mix 2026'
+  'Afrobeats Mix 2026',
+  'Amapiano 2026',
+  'Diamond Platnumz'
 ];
 
-// Curated explore feeds
-const EXPLORE_FEEDS = {
-  music: [
-    { id: '6B00VKKv0u8', title: '5G - Eddy Kenzo [Official Music Video]', uploader: 'Eddy Kenzo', views: '2.8M views', duration: '3:45', thumbnail: 'https://img.youtube.com/vi/6B00VKKv0u8/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=6B00VKKv0u8' },
-    { id: 'WKERHnuc4yo', title: 'Ayra Starr - Heaven Baby (Lyrics) ft. ZAYN', uploader: 'Ayra Starr', views: '5.4M views', duration: '3:12', thumbnail: 'https://img.youtube.com/vi/WKERHnuc4yo/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=WKERHnuc4yo' },
-    { id: 'jeMYgIfNwD8', title: 'Ayra Starr - Last Heartbreak Song ft. Giveon', uploader: 'Ayra Starr', views: '12M views', duration: '4:02', thumbnail: 'https://img.youtube.com/vi/jeMYgIfNwD8/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=jeMYgIfNwD8' },
-    { id: 'kJQP7kiw5Fk', title: 'Luis Fonsi - Despacito ft. Daddy Yankee', uploader: 'Luis Fonsi', views: '8.4B views', duration: '4:41', thumbnail: 'https://img.youtube.com/vi/kJQP7kiw5Fk/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=kJQP7kiw5Fk' }
-  ],
-  trending: [
-    { id: 'aqz-KE-bpKQ', title: 'Big Buck Bunny 60fps 4K - Blender Foundation Animation', uploader: 'Blender Foundation', views: '18M views', duration: '9:56', thumbnail: 'https://img.youtube.com/vi/aqz-KE-bpKQ/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=aqz-KE-bpKQ' },
-    { id: '3rXRgUwjuQ8', title: 'PASTOR VS TAATA KIMBOWA COMEDY COMPETITION', uploader: 'Uganda Comedy TV', views: '890K views', duration: '24:15', thumbnail: 'https://img.youtube.com/vi/3rXRgUwjuQ8/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=3rXRgUwjuQ8' },
-    { id: 'jNQXAC9IVRw', title: 'Me at the zoo - The First Video on YouTube', uploader: 'jawed', views: '310M views', duration: '0:19', thumbnail: 'https://img.youtube.com/vi/jNQXAC9IVRw/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=jNQXAC9IVRw' }
-  ],
-  movies: [
-    { id: 'Way9Dexny3w', title: 'Dune: Part Two - Official Movie Trailer #3', uploader: 'Warner Bros. Pictures', views: '38M views', duration: '2:56', thumbnail: 'https://img.youtube.com/vi/Way9Dexny3w/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=Way9Dexny3w' },
-    { id: 'd9MyW72ELq0', title: 'Avatar: The Way of Water - Official Teaser Trailer', uploader: '20th Century Studios', views: '52M views', duration: '1:37', thumbnail: 'https://img.youtube.com/vi/d9MyW72ELq0/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=d9MyW72ELq0' },
-    { id: 'TcMBFSGVi1c', title: 'Avengers: Endgame - Official Trailer', uploader: 'Marvel Entertainment', views: '158M views', duration: '2:26', thumbnail: 'https://img.youtube.com/vi/TcMBFSGVi1c/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=TcMBFSGVi1c' }
-  ],
-  comedy: [
-    { id: '3rXRgUwjuQ8', title: 'PASTOR VS TAATA KIMBOWA COMEDY COMPETITION', uploader: 'Uganda Comedy TV', views: '890K views', duration: '24:15', thumbnail: 'https://img.youtube.com/vi/3rXRgUwjuQ8/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=3rXRgUwjuQ8' },
-    { id: '2Vv-BfVoq4g', title: 'Ed Sheeran - Shape of You (Official Music Video)', uploader: 'Ed Sheeran', views: '6.2B views', duration: '4:23', thumbnail: 'https://img.youtube.com/vi/2Vv-BfVoq4g/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=2Vv-BfVoq4g' }
-  ],
-  gaming: [
-    { id: 'QkkoHAzjnUs', title: 'Grand Theft Auto VI Trailer 1', uploader: 'Rockstar Games', views: '210M views', duration: '1:30', thumbnail: 'https://img.youtube.com/vi/QkkoHAzjnUs/hqdefault.jpg', url: 'https://www.youtube.com/watch?v=QkkoHAzjnUs' }
-  ],
-  sports: [
-    { id: 'Y7tvb3y_4t8', title: 'Top 10 Impossible Goals in Football History', uploader: 'World Sports HD', views: '15M views', duration: '8:45', thumbnail: 'https://images.unsplash.com/photo-1508098682722-e99c43a406b2?w=500', url: 'https://www.youtube.com/watch?v=Y7tvb3y_4t8' }
-  ]
+// Explore category definitions
+const EXPLORE_METAS = {
+  music: {
+    title: 'African & Global Music Hits',
+    icon: '🎵',
+    description: 'Top African hits, Afrobeats, Amapiano, Bongo Flava, and global chart-toppers.',
+    queries: ['top latest african music 2026', 'afrobeats amapiano bongo flava 2026', 'latest uganda music videos 2026', 'top global music hits 2026']
+  },
+  trending: {
+    title: 'Trending Worldwide',
+    icon: '🔥',
+    description: 'The most watched, viral videos and trending topics worldwide right now.',
+    queries: ['trending music videos 2026', 'viral videos 2026', 'trending entertainment 2026', 'top viral news 2026']
+  },
+  movies: {
+    title: 'Movies & Cinema Trailers',
+    icon: '🎬',
+    description: 'New official movie trailers, film teasers, blockbuster clips, and cinema releases.',
+    queries: ['official movie trailers 2025 2026', 'latest blockbuster cinema trailer 2026', 'hollywood action movie trailers 2026', 'netflix official trailers 2026']
+  },
+  comedy: {
+    title: 'Comedy & Viral Skits',
+    icon: '😂',
+    description: 'Hilarious standup comedy, Ugandan comedy skits, viral pranks, and memes.',
+    queries: ['uganda comedy 2026 taata kimbowa', 'african comedy skits 2026', 'best standup comedy clips 2026', 'funny viral videos 2026']
+  },
+  gaming: {
+    title: 'Gaming & Highlights',
+    icon: '🎮',
+    description: 'Top gaming streams, GTA VI clips, esports highlights, and game walkthroughs.',
+    queries: ['gta 6 official trailer gameplay', 'top gaming moments 2026', 'playstation 5 best games trailer 2026', 'fifa gameplay highlights 2026']
+  },
+  sports: {
+    title: 'Sports & Football Goals',
+    icon: '⚽',
+    description: 'Football highlights, top goals, Premier League, Champions League, and boxing.',
+    queries: ['best football goals highlights 2026', 'premier league top goals this week', 'champions league match highlights 2026', 'impossible sports moments 2026']
+  }
 };
+
+// Helper: Scrape YouTube search results
+async function scrapeYouTubeQuery(q) {
+  try {
+    const res = await fetch(`https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+      }
+    });
+    const text = await res.text();
+    const match = text.match(/ytInitialData\s*=\s*({.+?});<\/script>/);
+    if (!match) return [];
+    const data = JSON.parse(match[1]);
+    const contents = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
+    const results = [];
+    for (const c of contents) {
+      const v = c.videoRenderer;
+      if (!v || !v.videoId) continue;
+      results.push({
+        id: v.videoId,
+        title: v.title?.runs?.[0]?.text || 'Video',
+        uploader: v.ownerText?.runs?.[0]?.text || v.longBylineText?.runs?.[0]?.text || 'Channel',
+        duration: v.lengthText?.simpleText || '3:30',
+        duration_sec: 210,
+        view_count: v.viewCountText?.simpleText || 'Popular',
+        thumbnail: v.thumbnail?.thumbnails?.pop()?.url || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+        url: `https://www.youtube.com/watch?v=${v.videoId}`
+      });
+    }
+    return results;
+  } catch (err) {
+    console.warn(`Query scrape error (${q}):`, err.message);
+    return [];
+  }
+}
+
+// Scrape up to 100 results using multi-query expansion
+async function searchYouTubeMulti(query, targetCount = 100) {
+  const cleanQ = String(query || '').trim();
+  const queries = [
+    cleanQ,
+    `${cleanQ} 2026`,
+    `${cleanQ} official video`,
+    `${cleanQ} full hd`,
+    `${cleanQ} hits`
+  ];
+
+  const seen = new Set();
+  const aggregated = [];
+
+  for (const q of queries) {
+    if (aggregated.length >= targetCount) break;
+    const batch = await scrapeYouTubeQuery(q);
+    for (const item of batch) {
+      if (!seen.has(item.id)) {
+        seen.add(item.id);
+        aggregated.push(item);
+        if (aggregated.length >= targetCount) break;
+      }
+    }
+  }
+
+  return aggregated;
+}
 
 // 1. Serve Downloader static assets & HTML
 router.use('/downloader', express.static(DOWNLOADER_PUBLIC_DIR, {
@@ -94,7 +173,6 @@ async function proxyToEngine(req, res, targetPath) {
     res.send(Buffer.from(buf));
     return true;
   } catch (err) {
-    console.warn(`Downloader engine proxy failed (${targetPath}):`, err.message);
     return false;
   }
 }
@@ -139,22 +217,63 @@ router.get(['/api/explore/categories', '/api/downloader/explore/categories'], as
   if (await proxyToEngine(req, res, '/api/explore/categories')) return;
   res.json({
     categories: [
-      { key: 'music', name: 'Music & Songs', icon: '🎵', description: 'Trending music videos, tracks and hits' },
-      { key: 'trending', name: 'Trending Now', icon: '🔥', description: 'What everyone is watching worldwide' },
-      { key: 'movies', name: 'Movies & Trailers', icon: '🎬', description: 'Latest blockbuster trailers & film clips' },
-      { key: 'comedy', name: 'Comedy & Clips', icon: '😂', description: 'Viral comedy, standup & skits' },
-      { key: 'gaming', name: 'Gaming', icon: '🎮', description: 'Top streams, gameplay & highlights' },
-      { key: 'sports', name: 'Sports Highlights', icon: '⚽', description: 'Football, goals & athletic feats' }
+      { key: 'music', name: 'African & Global Music Hits', icon: '🎵', description: 'Top African hits, Afrobeats, Amapiano, Bongo Flava' },
+      { key: 'trending', name: 'Trending Worldwide', icon: '🔥', description: 'What everyone is watching worldwide right now' },
+      { key: 'movies', name: 'Movies & Trailers', icon: '🎬', description: 'Latest blockbuster movie trailers and clips' },
+      { key: 'comedy', name: 'Comedy & Skits', icon: '😂', description: 'Ugandan & African comedy, viral skits and jokes' },
+      { key: 'gaming', name: 'Gaming Highlights', icon: '🎮', description: 'GTA VI, gaming walkthroughs and esports streams' },
+      { key: 'sports', name: 'Sports Highlights', icon: '⚽', description: 'Football goals, match highlights and skills' }
     ]
   });
 });
 
-// 5. Explore Feeds
+// 5. Explore Feeds (returns 50 to 100 items with 15-min cache)
 router.get(['/api/explore/:category', '/api/downloader/explore/:category'], async (req, res) => {
   const cat = String(req.params.category || 'music').toLowerCase();
   if (await proxyToEngine(req, res, `/api/explore/${cat}`)) return;
-  const items = EXPLORE_FEEDS[cat] || EXPLORE_FEEDS.trending || [];
-  res.json({ category: cat, items });
+  const meta = EXPLORE_METAS[cat] || EXPLORE_METAS.music;
+
+  // Check cache
+  const cached = exploreCache.get(cat);
+  const now = Date.now();
+  if (cached && (now - cached.time < 15 * 60 * 1000) && cached.results.length >= 20) {
+    return res.json({
+      category: cat,
+      title: meta.title,
+      icon: meta.icon,
+      description: meta.description,
+      total: cached.results.length,
+      results: cached.results,
+      items: cached.results
+    });
+  }
+
+  // Fetch up to 100 items from queries
+  const seen = new Set();
+  const results = [];
+  for (const q of meta.queries) {
+    if (results.length >= 100) break;
+    const batch = await scrapeYouTubeQuery(q);
+    for (const item of batch) {
+      if (!seen.has(item.id)) {
+        seen.add(item.id);
+        results.push(item);
+        if (results.length >= 100) break;
+      }
+    }
+  }
+
+  exploreCache.set(cat, { time: now, results });
+
+  res.json({
+    category: cat,
+    title: meta.title,
+    icon: meta.icon,
+    description: meta.description,
+    total: results.length,
+    results,
+    items: results
+  });
 });
 
 // Helper to extract YouTube video ID
@@ -163,44 +282,7 @@ function extractYouTubeId(urlOrText) {
   return m ? m[1] : null;
 }
 
-// Scrape YouTube search results for user queries
-async function searchYouTube(query) {
-  try {
-    const res = await fetch(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9'
-      }
-    });
-    const text = await res.text();
-    const match = text.match(/ytInitialData\s*=\s*({.+?});<\/script>/);
-    if (!match) return [];
-    const data = JSON.parse(match[1]);
-    const contents = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
-    const results = [];
-    for (const c of contents) {
-      const v = c.videoRenderer;
-      if (!v || !v.videoId) continue;
-      results.push({
-        id: v.videoId,
-        title: v.title?.runs?.[0]?.text || 'Video',
-        uploader: v.ownerText?.runs?.[0]?.text || v.longBylineText?.runs?.[0]?.text || 'Channel',
-        duration: v.lengthText?.simpleText || '3:30',
-        duration_sec: 210,
-        view_count: v.viewCountText?.simpleText || 'Popular',
-        thumbnail: v.thumbnail?.thumbnails?.pop()?.url || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-        url: `https://www.youtube.com/watch?v=${v.videoId}`
-      });
-      if (results.length >= 30) break;
-    }
-    return results;
-  } catch (err) {
-    console.warn('YouTube live search failed:', err.message);
-    return [];
-  }
-}
-
-// 6. Media Analyzer (Supports YouTube, Social Media & Search Queries)
+// 6. Media Analyzer & Search (Returns up to 100 items for search, or format modal options for video)
 router.post(['/api/analyze', '/api/downloader/analyze'], async (req, res) => {
   if (await proxyToEngine(req, res, '/api/analyze')) return;
   try {
@@ -210,20 +292,14 @@ router.post(['/api/analyze', '/api/downloader/analyze'], async (req, res) => {
     const isUrl = /^https?:\/\//i.test(rawInput) || rawInput.includes('youtube.com') || rawInput.includes('youtu.be') || rawInput.includes('tiktok.com') || rawInput.includes('instagram.com') || rawInput.includes('x.com') || rawInput.includes('twitter.com');
     const ytId = extractYouTubeId(rawInput);
 
-    // MODE 1: SEARCH QUERY (Not a direct URL)
+    // MODE 1: SEARCH QUERY (Returns up to 100 search results)
     if (!isUrl && !ytId) {
-      let results = await searchYouTube(rawInput);
-      if (!results.length) {
-        // Fallback search across explore feeds
-        const lowerQ = rawInput.toLowerCase();
-        const allItems = Object.values(EXPLORE_FEEDS).flat();
-        results = allItems.filter(item => item.title.toLowerCase().includes(lowerQ) || item.uploader.toLowerCase().includes(lowerQ));
-        if (!results.length) results = allItems.slice(0, 8);
-      }
+      const results = await searchYouTubeMulti(rawInput, 100);
 
       return res.json({
         type: 'search_results',
         query: rawInput,
+        total: results.length,
         results
       });
     }
@@ -233,7 +309,7 @@ router.post(['/api/analyze', '/api/downloader/analyze'], async (req, res) => {
     let uploader = 'Universal Media Web';
     let thumbnail = 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500';
     let duration = '3:30';
-    let viewCount = '1.2M';
+    let viewCount = '1.8M';
 
     if (ytId) {
       thumbnail = `https://img.youtube.com/vi/${ytId}/hqdefault.jpg`;
@@ -262,7 +338,7 @@ router.post(['/api/analyze', '/api/downloader/analyze'], async (req, res) => {
     ];
 
     const audio_options = [
-      { quality: '320k', label: 'MP3 High Quality', badge: '320 kbps', format_id: 'bestaudio/best', ext: 'mp3', size_str: '~7.8 MB', recommended: true },
+      { quality: '320k', label: 'MP3 High Quality', badge: '320 kbps', format_id: 'bestaudio/best', ext: 'mp3', size_str: '~8.2 MB', recommended: true },
       { quality: '128k', label: 'MP3 Standard Quality', badge: '128 kbps', format_id: 'bestaudio/best', ext: 'mp3', size_str: '~3.4 MB', recommended: false }
     ];
 
