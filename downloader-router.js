@@ -163,21 +163,80 @@ function extractYouTubeId(urlOrText) {
   return m ? m[1] : null;
 }
 
-// 6. Media Analyzer (Supports YouTube, Social Media & Direct Links)
+// Scrape YouTube search results for user queries
+async function searchYouTube(query) {
+  try {
+    const res = await fetch(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+      }
+    });
+    const text = await res.text();
+    const match = text.match(/ytInitialData\s*=\s*({.+?});<\/script>/);
+    if (!match) return [];
+    const data = JSON.parse(match[1]);
+    const contents = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
+    const results = [];
+    for (const c of contents) {
+      const v = c.videoRenderer;
+      if (!v || !v.videoId) continue;
+      results.push({
+        id: v.videoId,
+        title: v.title?.runs?.[0]?.text || 'Video',
+        uploader: v.ownerText?.runs?.[0]?.text || v.longBylineText?.runs?.[0]?.text || 'Channel',
+        duration: v.lengthText?.simpleText || '3:30',
+        duration_sec: 210,
+        view_count: v.viewCountText?.simpleText || 'Popular',
+        thumbnail: v.thumbnail?.thumbnails?.pop()?.url || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+        url: `https://www.youtube.com/watch?v=${v.videoId}`
+      });
+      if (results.length >= 30) break;
+    }
+    return results;
+  } catch (err) {
+    console.warn('YouTube live search failed:', err.message);
+    return [];
+  }
+}
+
+// 6. Media Analyzer (Supports YouTube, Social Media & Search Queries)
 router.post(['/api/analyze', '/api/downloader/analyze'], async (req, res) => {
   if (await proxyToEngine(req, res, '/api/analyze')) return;
   try {
     const rawInput = String(req.body?.url || '').trim();
     if (!rawInput) return res.status(400).json({ error: 'Please provide a valid URL or search term.' });
 
+    const isUrl = /^https?:\/\//i.test(rawInput) || rawInput.includes('youtube.com') || rawInput.includes('youtu.be') || rawInput.includes('tiktok.com') || rawInput.includes('instagram.com') || rawInput.includes('x.com') || rawInput.includes('twitter.com');
     const ytId = extractYouTubeId(rawInput);
+
+    // MODE 1: SEARCH QUERY (Not a direct URL)
+    if (!isUrl && !ytId) {
+      let results = await searchYouTube(rawInput);
+      if (!results.length) {
+        // Fallback search across explore feeds
+        const lowerQ = rawInput.toLowerCase();
+        const allItems = Object.values(EXPLORE_FEEDS).flat();
+        results = allItems.filter(item => item.title.toLowerCase().includes(lowerQ) || item.uploader.toLowerCase().includes(lowerQ));
+        if (!results.length) results = allItems.slice(0, 8);
+      }
+
+      return res.json({
+        type: 'search_results',
+        query: rawInput,
+        results
+      });
+    }
+
+    // MODE 2: DIRECT MEDIA URL (Or YouTube link / ID)
     let title = rawInput;
     let uploader = 'Universal Media Web';
     let thumbnail = 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500';
     let duration = '3:30';
+    let viewCount = '1.2M';
 
     if (ytId) {
-      thumbnail = `https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`;
+      thumbnail = `https://img.youtube.com/vi/${ytId}/hqdefault.jpg`;
       try {
         const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${ytId}&format=json`);
         if (oembedRes.ok) {
@@ -188,33 +247,37 @@ router.post(['/api/analyze', '/api/downloader/analyze'], async (req, res) => {
         }
       } catch (_) {}
     } else if (rawInput.startsWith('http')) {
-      const parsed = new URL(rawInput);
-      title = `${parsed.hostname} Media Stream`;
-      uploader = parsed.hostname;
-    } else {
-      title = rawInput;
-      uploader = 'Search Result';
+      try {
+        const parsed = new URL(rawInput);
+        title = `${parsed.hostname} Video Stream`;
+        uploader = parsed.hostname;
+      } catch (_) {}
     }
 
-    const formats = [
-      { format_id: '1080p', quality: '1080p FHD', resolution: '1920x1080', ext: 'mp4', type: 'video', size_str: '~85 MB', note: 'Crystal Clear Full HD' },
-      { format_id: '720p', quality: '720p HD', resolution: '1280x720', ext: 'mp4', type: 'video', size_str: '~42 MB', note: 'Fast & High Definition (Recommended)' },
-      { format_id: '480p', quality: '480p SD', resolution: '854x480', ext: 'mp4', type: 'video', size_str: '~22 MB', note: 'Data Saver' },
-      { format_id: '360p', quality: '360p Mobile', resolution: '640x360', ext: 'mp4', type: 'video', size_str: '~14 MB', note: 'Ultra Light for Mobile' },
-      { format_id: 'mp3-320', quality: 'MP3 320 kbps', resolution: 'Audio Only', ext: 'mp3', type: 'audio', size_str: '~8.5 MB', note: 'Studio Master Quality Audio' },
-      { format_id: 'mp3-128', quality: 'MP3 128 kbps', resolution: 'Audio Only', ext: 'mp3', type: 'audio', size_str: '~3.6 MB', note: 'Standard High Quality MP3' },
-      { format_id: 'm4a-128', quality: 'M4A Audio', resolution: 'Audio Only', ext: 'm4a', type: 'audio', size_str: '~3.2 MB', note: 'AAC Lossless Audio' }
+    const video_options = [
+      { quality: '1080p', label: 'Full HD 1080p', badge: '1080p', format_id: 'bestvideo[height<=1080]+bestaudio/best', ext: 'mp4', size_str: '~68 MB', recommended: true },
+      { quality: '720p', label: 'HD 720p', badge: '720p', format_id: 'bestvideo[height<=720]+bestaudio/best', ext: 'mp4', size_str: '~34 MB', recommended: false },
+      { quality: '480p', label: 'Standard 480p', badge: '480p', format_id: 'bestvideo[height<=480]+bestaudio/best', ext: 'mp4', size_str: '~18 MB', recommended: false },
+      { quality: '360p', label: 'Medium 360p', badge: '360p', format_id: 'bestvideo[height<=360]+bestaudio/best', ext: 'mp4', size_str: '~10 MB', recommended: false }
+    ];
+
+    const audio_options = [
+      { quality: '320k', label: 'MP3 High Quality', badge: '320 kbps', format_id: 'bestaudio/best', ext: 'mp3', size_str: '~7.8 MB', recommended: true },
+      { quality: '128k', label: 'MP3 Standard Quality', badge: '128 kbps', format_id: 'bestaudio/best', ext: 'mp3', size_str: '~3.4 MB', recommended: false }
     ];
 
     res.json({
-      success: true,
-      url: rawInput,
-      video_id: ytId || 'direct',
+      type: 'video',
+      id: ytId || 'direct',
       title,
       uploader,
       thumbnail,
       duration,
-      formats
+      duration_sec: 210,
+      view_count: viewCount,
+      url: rawInput.startsWith('http') ? rawInput : `https://www.youtube.com/watch?v=${ytId || ''}`,
+      video_options,
+      audio_options
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Analysis error occurred.' });
@@ -382,7 +445,6 @@ router.get(['/api/proxy', '/api/downloader/proxy'], async (req, res) => {
 
     if (ctype.includes('text/html')) {
       let bodyText = await proxyRes.text();
-      // Inject base tag
       const parsedUrl = new URL(fullUrl);
       const baseTag = `<base href="${parsedUrl.origin}/">`;
       if (bodyText.includes('<head>')) {
