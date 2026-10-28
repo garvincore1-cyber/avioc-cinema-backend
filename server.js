@@ -360,6 +360,9 @@ async function trackRequestVisitor(req, activity = 'Browsing Home', userObj = nu
   } catch {}
 }
 
+const downloaderRouter = require('./downloader-router');
+app.use(downloaderRouter);
+
 app.get('/healthz', async (req, res) => {
   trackRequestVisitor(req, 'Browsing Home');
   try { await db.command({ ping: 1 }); res.json({ ok: true }); }

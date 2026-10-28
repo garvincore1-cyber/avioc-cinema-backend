@@ -40,6 +40,15 @@ No API credentials belong in frontend code, Git, or this file. Use Render's envi
 ## API outline
 
 - `GET /healthz`
+- `GET /downloader` — Garvinix Pro Universal Media Downloader web application
+- `GET /api/status` & `GET /api/downloader/status` — Downloader engine status & disk info
+- `GET /api/suggest?q=...` — Instant autocomplete search suggestions
+- `GET /api/explore/:category` — Explore & trending media feeds (music, trending, movies, comedy, etc.)
+- `POST /api/analyze` — Universal video/audio URL analyzer & quality formats
+- `POST /api/download` — Media download task initiator
+- `GET /api/downloads` — Active & completed tasks
+- `GET /api/library` — Downloaded media vault files
+- `GET /api/proxy?url=...` — In-app web browser frame proxy
 - `GET /api/plans`
 - `GET /api/prices/card`
 - `POST /api/auth/register` — `{ email, displayName, password }`

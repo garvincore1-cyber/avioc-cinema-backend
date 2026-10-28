@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <linearGradient id="garvGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF3366" />
+      <stop offset="100%" stop-color="#FF7700" />
+    </linearGradient>
+    <linearGradient id="glowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00F0FF" />
+      <stop offset="100%" stop-color="#0072FF" />
+    </linearGradient>
+  </defs>
+  <rect width="100" height="100" rx="22" fill="#0A0D18" stroke="#1F2840" stroke-width="2"/>
+  <path d="M 50 18 L 80 34 L 50 50 L 20 34 Z" fill="url(#garvGrad)" />
+  <path d="M 20 48 L 50 64 L 80 48" stroke="url(#garvGrad)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none" />
+  <path d="M 20 62 L 50 78 L 80 62" stroke="url(#garvGrad)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none" />
+  <circle cx="50" cy="50" r="8" fill="url(#glowGrad)"/>
+</svg>

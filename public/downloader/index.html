@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>GARVINIX - Universal Video & Music Downloader & Browser</title>
+  
+  <!-- Google Fonts: Space Grotesk & Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@600;700;800&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="./static/css/garvinix.css">
+  <!-- Avioc Cinema API Configuration & Smart Backend Router -->
+  <script src="../api-config.js"></script>
+  <script>
+    (function() {
+      const origFetch = window.fetch;
+      const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+      const apiBase = (window.AVIOC_API_BASE_URL || (!isLocal && window.location.hostname ? 'https://avioc-cinema-backend.onrender.com' : '')).replace(/\/+$/, '');
+      if (apiBase) {
+        window.fetch = function(url, opts) {
+          if (typeof url === 'string' && url.startsWith('/api/')) {
+            url = apiBase + url;
+          }
+          return origFetch.call(this, url, opts);
+        };
+      }
+    })();
+  </script>
+</head>
+<body>
+
+  <div class="app-container">
+    
+    <!-- TOP APP HEADER -->
+    <header class="app-header">
+      <div class="header-brand">
+        <div class="brand-logo-icon">
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="url(#grad1)"/>
+            <path d="M2 17L12 22L22 17" stroke="url(#grad1)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M2 12L12 17L22 12" stroke="url(#grad1)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <defs>
+              <linearGradient id="grad1" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#FF3366"/>
+                <stop offset="1" stop-color="#FF7700"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <div>
+          <span class="brand-title">GARVINIX <span class="brand-badge">PRO</span></span>
+          <span class="brand-tagline">UNIVERSAL MEDIA BROWSER & DOWNLOADER</span>
+        </div>
+      </div>
+
+      <!-- DESKTOP NAV TABS -->
+      <nav class="desktop-nav">
+        <button class="nav-tab-btn active" data-tab="tab-search">
+          <span>🔍</span> Explore & Search
+        </button>
+        <button class="nav-tab-btn" data-tab="tab-browser">
+          <span>🌐</span> Web Browser
+        </button>
+        <button class="nav-tab-btn" data-tab="tab-downloads">
+          <span>📥</span> Active Tasks
+          <span id="header-active-count" class="tab-counter-badge" style="display:none;">0</span>
+        </button>
+        <button class="nav-tab-btn" data-tab="tab-vault">
+          <span>📁</span> Media Vault
+          <span id="header-library-count" class="tab-counter-badge">0</span>
+        </button>
+      </nav>
+
+      <!-- RIGHT STATUS CHIP -->
+      <div class="header-actions">
+        <button id="btn-open-downloads-folder" class="btn-hdr-action" title="Open Downloads Folder in Explorer">
+          <span>📂</span> Open Folder
+        </button>
+                <a href="../" class="btn-hdr-action" style="text-decoration:none;color:#f3a43b;border-color:rgba(243,164,59,0.4);font-weight:700" title="Return to Avioc Cinema">
+          <span>🍿</span> Avioc Cinema
+        </a>
+        <div id="system-status-chip" class="status-chip" title="Checking engine status...">
+          <span class="status-dot"></span> <span id="status-chip-text">Garvinix Ready</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- MAIN BODY CONTAINER -->
+    <main class="main-content">
+      
+      <!-- ====================================================================
+           TAB 1: EXPLORE & SEARCH (HOME)
+           ==================================================================== -->
+      <section id="tab-search" class="tab-panel active">
+        
+        <!-- HERO SEARCH / URL SECTION -->
+        <div class="hero-search-card">
+          <div class="hero-glow"></div>
+          
+          <h1 class="hero-title">
+            Explore, Watch & Download Any Video or MP3
+          </h1>
+          <p class="hero-subtitle">
+            Browse trending feeds, search any video title, or paste links from YouTube, TikTok, Instagram, Twitter, SoundCloud & 1000+ sites!
+          </p>
+
+          <!-- BIG INPUT BAR WITH AUTOCOMPLETE -->
+          <div class="search-input-wrapper-outer">
+            <div class="search-input-wrapper">
+              <div class="input-icon">🔍</div>
+              <input 
+                type="text" 
+                id="main-url-input" 
+                class="main-search-input" 
+                placeholder="Search videos, songs or paste any video/music link..."
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button type="button" id="btn-clear-input" class="btn-input-clear" style="display:none;" title="Clear input">&times;</button>
+              <button type="button" id="btn-paste-clipboard" class="btn-input-paste" title="Paste from clipboard">
+                <span>📋</span> Paste
+              </button>
+              <button type="button" id="btn-submit-search" class="btn-input-download">
+                <span id="btn-submit-icon">⚡</span> <span id="btn-submit-label">Search / Download</span>
+              </button>
+            </div>
+
+            <!-- AUTOCOMPLETE SUGGESTIONS POPUP -->
+            <div id="search-autocomplete-box" class="search-autocomplete-box" style="display:none;"></div>
+          </div>
+
+          <!-- RECENT SEARCHES CHIPS STRIP -->
+          <div id="recent-searches-box" class="recent-searches-strip" style="display:none;">
+            <span class="recent-label">🕒 Recent:</span>
+            <div class="recent-chips-list" id="recent-chips-container"></div>
+            <button id="btn-clear-history" class="btn-clear-history" title="Clear Search History">&times; Clear</button>
+          </div>
+
+          <!-- PLATFORM SHORTCUT PILLS (OPENS DIRECTLY IN IN-APP BROWSER) -->
+          <div class="platforms-strip">
+            <span class="platform-label">Supported:</span>
+            <div class="platform-pill" data-hint="youtube" data-url="https://m.youtube.com">
+              <span class="pill-icon yt">▶</span> YouTube
+            </div>
+            <div class="platform-pill" data-hint="whatsapp" data-url="https://web.whatsapp.com">
+              <span class="pill-icon wa">💬</span> WhatsApp
+            </div>
+            <div class="platform-pill" data-hint="tiktok" data-url="https://www.tiktok.com">
+              <span class="pill-icon tt">🎵</span> TikTok
+            </div>
+            <div class="platform-pill" data-hint="instagram" data-url="https://www.instagram.com">
+              <span class="pill-icon ig">📸</span> Instagram
+            </div>
+            <div class="platform-pill" data-hint="facebook" data-url="https://m.facebook.com">
+              <span class="pill-icon fb">👥</span> Facebook
+            </div>
+            <div class="platform-pill" data-hint="twitter" data-url="https://x.com">
+              <span class="pill-icon tw">🐦</span> Twitter / X
+            </div>
+            <div class="platform-pill" data-hint="soundcloud" data-url="https://soundcloud.com">
+              <span class="pill-icon sc">☁</span> SoundCloud
+            </div>
+            <div class="platform-pill" data-hint="reddit" data-url="https://www.reddit.com">
+              <span class="pill-icon rd">🔴</span> Reddit
+            </div>
+            <div class="platform-pill" data-hint="1000+" data-url="https://www.google.com">
+              <span class="pill-icon ml">🌐</span> 1,000+ Sites
+            </div>
+          </div>
+
+          <!-- EXPLORE CATEGORY CHIPS BAR -->
+          <div class="explore-nav-container">
+            <div class="explore-nav-label">Browse Feeds:</div>
+            <div class="explore-chips-list" id="explore-chips-container">
+              <button class="explore-chip active" data-category="music">
+                <span class="chip-icon">🎵</span> African Music Hits
+              </button>
+              <button class="explore-chip" data-category="afrobeats">
+                <span class="chip-icon">🌍</span> Afrobeats & Amapiano
+              </button>
+              <button class="explore-chip" data-category="movies">
+                <span class="chip-icon">🎬</span> Trailers
+              </button>
+              <button class="explore-chip" data-category="gaming">
+                <span class="chip-icon">🎮</span> Gaming
+              </button>
+              <button class="explore-chip" data-category="shorts">
+                <span class="chip-icon">📱</span> Shorts
+              </button>
+              <button class="explore-chip" data-category="comedy">
+                <span class="chip-icon">😂</span> Comedy
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- SEARCH RESULTS SECTION -->
+        <div id="search-results-section" class="search-results-section" style="display:none;">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">
+                <span>🔍</span> Search Results for "<span id="search-query-display"></span>"
+              </h2>
+              <div class="section-subtitle">Click "Watch" to play in-app or "Download" for 4K/MP3</div>
+            </div>
+            <div style="display:flex; gap:10px; align-items:center;">
+              <span id="search-results-count" class="badge-count">0 items</span>
+              <button id="btn-back-to-explore" class="btn-secondary-sm" title="Back to Explore Feeds">
+                <span>🔥</span> Back to Explore
+              </button>
+            </div>
+          </div>
+          
+          <div id="search-cards-grid" class="search-cards-grid">
+            <!-- Search video cards injected dynamically -->
+          </div>
+        </div>
+
+        <!-- EXPLORE / DISCOVERY FEED SECTION -->
+        <div id="explore-feed-section" class="explore-feed-section">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title" id="explore-section-title">
+                <span id="explore-title-icon">🔥</span> <span id="explore-title-text">Trending Now</span>
+              </h2>
+              <div class="section-subtitle" id="explore-title-desc">Hottest viral videos and popular media across the web</div>
+            </div>
+            <button id="btn-refresh-explore" class="btn-secondary-sm" title="Refresh feed">
+              <span>🔄</span> Refresh Feed
+            </button>
+          </div>
+
+          <div id="explore-cards-grid" class="search-cards-grid">
+            <!-- Explore video cards injected dynamically -->
+            <div class="feed-loading-placeholder">
+              <div class="loading-spinner"></div>
+              <div>Loading fresh video feed...</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- FEATURE HIGHLIGHTS -->
+        <div id="features-banner" class="features-banner">
+          <div class="feature-card">
+            <div class="feature-icon">🚀</div>
+            <div class="feature-title">Ultra High Speed</div>
+            <div class="feature-desc">Multi-threaded engine downloading at full network bandwidth.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon">💎</div>
+            <div class="feature-title">4K & 1080p Full HD</div>
+            <div class="feature-desc">Automatic audio/video stream merging with hardware-accelerated FFmpeg.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon">🎵</div>
+            <div class="feature-title">Crystal Clear MP3</div>
+            <div class="feature-desc">Direct extraction up to 320 kbps high-fidelity audio with metadata tags.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon">📱</div>
+            <div class="feature-title">Any Device Ready</div>
+            <div class="feature-desc">Responsive on phones, tablets, TV screens and desktop browsers.</div>
+          </div>
+        </div>
+
+        <!-- SAVED PLAYLISTS SHELF (PERSISTED QUEUES) -->
+        <div id="saved-playlists-section" class="saved-playlists-section" style="display:none; margin-top: 32px;">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title"><span>📂</span> Saved Playlists</h2>
+              <p class="section-subtitle">Your saved queues and collections ready for instant playback</p>
+            </div>
+          </div>
+          <div id="saved-playlists-grid" class="search-cards-grid">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+
+      </section>
+
+      <!-- ====================================================================
+           TAB 2: IN-APP WEB BROWSER WITH FLOATING SNIFFER (VIDMATE-STYLE)
+           ==================================================================== -->
+      <section id="tab-browser" class="tab-panel">
+        <div class="browser-container">
+          
+          <!-- BROWSER TOP CONTROL BAR -->
+          <div class="browser-toolbar">
+            <div class="browser-nav-btns">
+              <button id="btn-browser-back" class="btn-browser-icon" title="Go Back">◀</button>
+              <button id="btn-browser-forward" class="btn-browser-icon" title="Go Forward">▶</button>
+              <button id="btn-browser-refresh" class="btn-browser-icon" title="Reload Page">🔄</button>
+            </div>
+            
+            <div class="browser-url-bar-wrapper">
+              <span class="browser-padlock">🔒</span>
+              <input 
+                type="text" 
+                id="browser-url-input" 
+                class="browser-url-input" 
+                placeholder="Enter website URL or search (e.g. m.youtube.com, web.whatsapp.com, tiktok.com)..."
+                value="https://m.youtube.com"
+                spellcheck="false"
+              />
+              <button id="btn-browser-go" class="btn-browser-go">Go</button>
+            </div>
+
+            <button id="btn-browser-popout" class="btn-browser-icon" title="Open in Dedicated Window">
+              <span>🚀</span>
+            </button>
+
+            <button id="btn-browser-sniff" class="btn-browser-sniff-top" title="Download video from this page">
+              <span>⚡</span> Sniff & Download
+            </button>
+          </div>
+
+          <!-- QUICK BOOKMARK PORTALS STRIP -->
+          <div class="browser-bookmarks-strip">
+            <span class="bookmark-label">Portals:</span>
+            <button class="btn-bookmark" data-url="https://m.youtube.com">
+              <span>▶</span> YouTube
+            </button>
+            <button class="btn-bookmark" data-url="https://web.whatsapp.com">
+              <span style="color:#25d366;">💬</span> WhatsApp
+            </button>
+            <button class="btn-bookmark" data-url="https://www.tiktok.com">
+              <span>🎵</span> TikTok
+            </button>
+            <button class="btn-bookmark" data-url="https://www.instagram.com">
+              <span>📸</span> Instagram
+            </button>
+            <button class="btn-bookmark" data-url="https://m.soundcloud.com">
+              <span>☁</span> SoundCloud
+            </button>
+            <button class="btn-bookmark" data-url="https://x.com">
+              <span>🐦</span> X / Twitter
+            </button>
+            <button class="btn-bookmark" data-url="https://m.facebook.com">
+              <span>👥</span> Facebook
+            </button>
+            <button class="btn-bookmark" data-url="https://www.reddit.com">
+              <span>🔴</span> Reddit
+            </button>
+            <button class="btn-bookmark" data-url="https://www.dailymotion.com">
+              <span>🎬</span> Dailymotion
+            </button>
+          </div>
+
+          <!-- BROWSER FRAME VIEWPORT -->
+          <div class="browser-viewport-wrapper">
+            <iframe 
+              id="browser-iframe" 
+              class="browser-iframe" 
+              src="https://m.youtube.com" 
+              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation"
+              allowfullscreen
+            ></iframe>
+
+            <!-- FLOATING ACTION DOWNLOAD SNIFFER BUTTON -->
+            <button id="btn-floating-sniffer" class="floating-sniffer-btn" title="Download Media from Current Page">
+              <span class="sniffer-icon-lightning">⚡</span>
+              <span class="sniffer-label">Download This Video</span>
+              <span class="sniffer-badge-pulse"></span>
+            </button>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ====================================================================
+           TAB 3: ACTIVE DOWNLOADS QUEUE
+           ==================================================================== -->
+      <section id="tab-downloads" class="tab-panel">
+        <div class="section-header">
+          <div>
+            <h2 class="section-title"><span>📥</span> Downloads Manager</h2>
+            <div class="section-subtitle">Real-time download speeds, progress and background tasks</div>
+          </div>
+          <div class="queue-actions">
+            <button id="btn-clear-completed" class="btn-secondary-sm">
+              <span>🧹</span> Clear Finished
+            </button>
+            <button id="btn-open-folder-queue" class="btn-primary-sm">
+              <span>📂</span> Open Folder
+            </button>
+          </div>
+        </div>
+
+        <div id="downloads-list-container" class="downloads-list">
+          <!-- Injected dynamically -->
+          <div class="empty-state">
+            <div class="empty-icon">📥</div>
+            <h3>No Active Downloads</h3>
+            <p>Paste a video link or search for music on the home tab to start downloading!</p>
+            <button class="btn-accent-pill" onclick="window.garvinixApp.switchTab('tab-search')">
+              + Start a Download
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ====================================================================
+           TAB 4: MEDIA VAULT / LIBRARY
+           ==================================================================== -->
+      <section id="tab-vault" class="tab-panel">
+        <div class="section-header">
+          <div>
+            <h2 class="section-title"><span>📁</span> Downloaded Media Vault</h2>
+            <div class="section-subtitle">Play, view, and organize all your saved videos and music</div>
+          </div>
+          <div class="queue-actions">
+            <div class="filter-pills">
+              <button class="filter-pill active" data-filter="all">All</button>
+              <button class="filter-pill" data-filter="video">Videos</button>
+              <button class="filter-pill" data-filter="audio">Audio (MP3)</button>
+            </div>
+            <button id="btn-refresh-library" class="btn-secondary-sm" title="Refresh library">
+              <span>🔄</span> Refresh
+            </button>
+            <button id="btn-open-folder-vault" class="btn-primary-sm">
+              <span>📂</span> Open Folder
+            </button>
+          </div>
+        </div>
+
+        <div id="library-grid-container" class="library-grid">
+          <!-- Populated dynamically -->
+        </div>
+      </section>
+
+    </main>
+
+    <!-- MOBILE BOTTOM NAVIGATION BAR -->
+    <nav class="mobile-bottom-nav">
+      <button class="mobile-nav-item active" data-tab="tab-search">
+        <span class="m-icon">🔍</span>
+        <span class="m-label">Explore</span>
+      </button>
+      <button class="mobile-nav-item" data-tab="tab-browser">
+        <span class="m-icon">🌐</span>
+        <span class="m-label">Browser</span>
+      </button>
+      <button class="mobile-nav-item" data-tab="tab-downloads">
+        <span class="m-icon">
+          📥
+          <span id="mobile-active-count" class="m-badge" style="display:none;">0</span>
+        </span>
+        <span class="m-label">Tasks</span>
+      </button>
+      <button class="mobile-nav-item" data-tab="tab-vault">
+        <span class="m-icon">📁</span>
+        <span class="m-label">Vault</span>
+      </button>
+    </nav>
+
+    <!-- ====================================================================
+         MODAL 1: GARVINIX QUALITY & FORMAT PICKER
+         ==================================================================== -->
+    <div id="modal-quality-picker" class="modal-overlay">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title">
+            <span>⚡</span> Choose Download Quality
+          </div>
+          <button class="btn-close-modal" id="btn-close-quality-modal">&times;</button>
+        </div>
+
+        <!-- Video Header Preview -->
+        <div class="modal-video-preview">
+          <img id="modal-video-thumb" src="" alt="Thumbnail" class="modal-thumb"/>
+          <div class="modal-video-info">
+            <div id="modal-video-title" class="modal-v-title">Loading title...</div>
+            <div class="modal-v-meta">
+              <span id="modal-video-channel" class="modal-v-channel">Channel</span>
+              <span class="meta-dot">•</span>
+              <span id="modal-video-duration" class="modal-v-duration">00:00</span>
+              <span class="meta-dot">•</span>
+              <span id="modal-video-views" class="modal-v-views">0 views</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Format Options Tabs (Video vs Audio) -->
+        <div class="format-tabs-header">
+          <button class="fmt-tab-btn active" id="tab-btn-video-formats">
+            <span>🎥</span> Video (MP4)
+          </button>
+          <button class="fmt-tab-btn" id="tab-btn-audio-formats">
+            <span>🎧</span> Audio (MP3)
+          </button>
+        </div>
+
+        <!-- Options Container -->
+        <div class="modal-format-list-container">
+          
+          <!-- Video Options List -->
+          <div id="fmt-panel-video" class="format-panel active">
+            <div id="video-options-list" class="format-options-list">
+              <!-- Video choices injected -->
+            </div>
+          </div>
+
+          <!-- Audio Options List -->
+          <div id="fmt-panel-audio" class="format-panel">
+            <div id="audio-options-list" class="format-options-list">
+              <!-- Audio choices injected -->
+            </div>
+          </div>
+
+        </div>
+
+        <div class="modal-footer">
+          <span class="modal-hint">⚡ Videos are saved directly to your Garvinix <code>downloads/</code> folder</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ====================================================================
+         MODAL 2: SCREEN-SMART CINEMA PLAYER WITH UP-NEXT & AUTOPLAY (AVIOC STYLE)
+         ==================================================================== -->
+    <div id="modal-player" class="modal-overlay cinema-viewport">
+      <div class="modal-card player-modal-card">
+        
+        <!-- SMART PLAYER FLOATING HEADER -->
+        <div class="modal-header player-hdr-smart">
+          <div class="player-hdr-left">
+            <div class="modal-title player-title-text" id="player-modal-title">
+              <span>▶</span> Now Playing
+            </div>
+            <div class="pbadges">
+              <span class="pill gold">GARVINIX CINEMA</span>
+              <span class="pill" id="player-format-pill">HD</span>
+              <span id="player-queue-badge" class="player-queue-badge" style="display:none;">1 / 1</span>
+            </div>
+          </div>
+
+          <div class="player-hdr-actions">
+            <!-- Autoplay Next Toggle Switch -->
+            <label class="autoplay-toggle" title="Auto-play next video when finished">
+              <input type="checkbox" id="chk-player-autoplay" checked />
+              <span class="toggle-slider"></span>
+              <span class="autoplay-label">Auto-Next</span>
+            </label>
+
+            <!-- Aspect Ratio Switch (16:9 / 9:16 Shorts / Fill) -->
+            <button id="btn-player-aspect" class="btn-player-tool" title="Aspect Ratio (Fit / Shorts 9:16)">
+              <span id="aspect-mode-icon">📺</span>
+            </button>
+
+            <!-- Picture-in-Picture Floating Mini Player -->
+            <button id="btn-player-pip" class="btn-player-tool" title="Picture-in-Picture (PiP)">
+              <span>🪟</span>
+            </button>
+
+            <!-- Fullscreen Expand -->
+            <button id="btn-player-fullscreen" class="btn-player-tool" title="Toggle Fullscreen (F)">
+              <span id="fs-icon">⛶</span>
+            </button>
+
+            <!-- Download Button -->
+            <button id="btn-player-download-current" class="btn-primary-sm" style="display:none;" title="Download this video">
+              <span>⚡</span> Download
+            </button>
+            
+            <button class="btn-close-modal" id="btn-close-player-modal" title="Close Cinema Player (Esc)">&times;</button>
+          </div>
+        </div>
+
+        <!-- PLAYER STAGE (FILLS SCREEN BEHIND UI) -->
+        <div class="player-stage" id="player-stage-box">
+          
+          <!-- Double-Tap Seek Ripples (Touch/Click) -->
+          <div class="seek-ripple seek-left" id="seek-ripple-left"><span>◀◀ 10s</span></div>
+          <div class="seek-ripple seek-right" id="seek-ripple-right"><span>10s ▶▶</span></div>
+
+          <!-- UP NEXT COUNTDOWN OVERLAY -->
+          <div class="up-next-overlay" id="player-up-next-overlay" style="display:none;">
+            <div class="up-next-card">
+              <div class="up-next-header">
+                <span class="up-next-chip">UP NEXT IN <span id="up-next-countdown-num">3</span>s</span>
+                <button id="btn-up-next-cancel" class="btn-icon-dismiss" title="Cancel Auto-Next">&times;</button>
+              </div>
+              <div class="up-next-details">
+                <img id="up-next-thumb" class="up-next-thumb" src="" alt="Thumbnail" />
+                <div class="up-next-info">
+                  <div id="up-next-title" class="up-next-title">Loading next video...</div>
+                  <div id="up-next-uploader" class="up-next-uploader">Channel</div>
+                </div>
+              </div>
+              <div class="up-next-actions">
+                <button id="btn-up-next-cancel-action" class="btn-secondary-sm">Stay Here</button>
+                <button id="btn-up-next-play-now" class="btn-primary-sm">▶ Play Now (⏭️)</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Online Video Iframe Preview -->
+          <iframe 
+            id="cinema-iframe-element" 
+            class="cinema-iframe"
+            style="display:none;" 
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
+            allowfullscreen
+          ></iframe>
+
+          <!-- Local Vault Video Element -->
+          <video id="cinema-video-element" controls playsinline></video>
+
+          <!-- Local Vault Audio Element + Visualizer -->
+          <div id="audio-visualizer-container" class="audio-visualizer-stage" style="display:none;">
+            <div class="audio-disc-spin">
+              <span style="font-size: 54px;">🎵</span>
+            </div>
+            <div class="sound-wave-bars">
+              <span></span><span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <audio id="cinema-audio-element" controls style="width: 85%; margin-top: 20px;"></audio>
+          </div>
+        </div>
+
+        <!-- DOCKED UP-NEXT PLAYLIST CAROUSEL (AVIOC CINEMA STYLE) -->
+        <div class="pdock" id="pdock" style="display:none;">
+          <div class="pdock-header">
+            <div class="pdock-title-row">
+              <span class="pdock-glow-dot"></span>
+              <span class="pdock-title">Upcoming Videos</span>
+              <span id="pdock-count" class="pdock-badge">0 queued</span>
+            </div>
+            <div class="pdock-header-actions" style="display:flex; align-items:center; gap:8px;">
+              <button id="btn-save-current-playlist" class="btn-dock-action" title="Save this queue as a Playlist" style="background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15); color: #fff; border-radius: 6px; padding: 2px 8px; font-size: 11px; cursor: pointer;">
+                <span>💾</span> Save
+              </button>
+              <button id="btn-toggle-dock" class="btn-dock-toggle" title="Toggle Queue Visibility">
+                <span id="dock-toggle-icon">▾</span>
+              </button>
+            </div>
+          </div>
+          <div class="list" id="pdock-list"></div>
+        </div>
+
+        <!-- IN-PLAYER FLOATING REALTIME DOWNLOAD PROGRESS BAR -->
+        <div class="player-download-progress" id="player-dl-progress" style="display:none;">
+          <div class="dl-prog-header">
+            <div class="dl-prog-title-row">
+              <span class="dl-prog-pulse"></span>
+              <span class="dl-prog-title" id="player-dl-title">Downloading video...</span>
+              <span class="dl-prog-badge" id="player-dl-badge">HD</span>
+            </div>
+            <div class="dl-prog-stats" id="player-dl-meta">0% • Connecting...</div>
+            <button class="btn-dl-prog-close" id="btn-player-dl-close" title="Dismiss">&times;</button>
+          </div>
+          <div class="dl-prog-track">
+            <div class="dl-prog-fill" id="player-dl-bar-fill" style="width: 0%;"></div>
+          </div>
+        </div>
+
+        <!-- SMART PLAYER FOOTER WITH PREV/NEXT CONTROLS -->
+        <div class="player-footer player-ftr-smart">
+          <div class="player-playback-nav">
+            <button id="btn-player-prev" class="btn-player-nav" title="Previous Video (B)">
+              <span>⏮️</span> Prev
+            </button>
+            <button id="btn-player-next" class="btn-player-nav active" title="Next Video (N)">
+              Next <span>⏭️</span>
+            </button>
+          </div>
+
+          <div id="player-file-info" class="player-file-meta">Screen Smart Cinema Player</div>
+
+          <div class="player-controls-right">
+            <button id="btn-player-open-file" class="btn-secondary-sm">
+              <span>📂</span> Show in Folder
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TOAST NOTIFICATION STACK -->
+    <div id="toast-stack" class="toast-stack"></div>
+
+  </div>
+
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script src="./static/js/player.js"></script>
+  <script src="./static/js/app.js"></script>
+</body>
+</html>
