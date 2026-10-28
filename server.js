@@ -1635,25 +1635,25 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
       visitors.countDocuments({ last_seen: { $gte: sevenDaysAgo } }),
       visitors.countDocuments({ last_seen: { $gte: thirtyDaysAgo } }),
       visitors.find({ last_seen: { $gte: liveCutoff } }).sort({ last_seen: -1 }).limit(200).toArray(),
-      visitors.find({}).sort({ last_seen: -1 }).limit(120).toArray(),
+      visitors.find({}).sort({ last_seen: -1 }).limit(300).toArray(),
       analyticsCounters.find({ kind: 'daily' }).sort({ date: -1 }).limit(30).toArray(),
-      analyticsCounters.find({ kind: 'share_item' }).sort({ count: -1, share_opens: -1 }).limit(40).toArray(),
-      analyticsCounters.find({ kind: 'search_query' }).sort({ count: -1 }).limit(50).toArray(),
-      analyticsCounters.find({ kind: 'search_query', zero_results: true }).sort({ count: -1 }).limit(30).toArray(),
-      analyticsCounters.find({ kind: 'play_item' }).sort({ count: -1, watch_seconds: -1 }).limit(50).toArray(),
-      analyticsCounters.find({ kind: 'vj_play' }).sort({ count: -1, watch_seconds: -1 }).limit(25).toArray(),
-      analyticsCounters.find({ kind: 'watchlist_item', count: { $gt: 0 } }).sort({ count: -1 }).limit(30).toArray(),
-      analyticsCounters.find({ kind: 'error_item', count: { $gt: 0 } }).sort({ count: -1, updated_at: -1 }).limit(30).toArray(),
-      analyticsEvents.find({}).sort({ created_at: -1 }).limit(120).toArray(),
+      analyticsCounters.find({ kind: 'share_item' }).sort({ count: -1, share_opens: -1 }).limit(100).toArray(),
+      analyticsCounters.find({ kind: 'search_query' }).sort({ count: -1 }).limit(500).toArray(),
+      analyticsCounters.find({ kind: 'search_query', zero_results: true }).sort({ count: -1 }).limit(150).toArray(),
+      analyticsCounters.find({ kind: 'play_item' }).sort({ count: -1, watch_seconds: -1 }).limit(100).toArray(),
+      analyticsCounters.find({ kind: 'vj_play' }).sort({ count: -1, watch_seconds: -1 }).limit(50).toArray(),
+      analyticsCounters.find({ kind: 'watchlist_item', count: { $gt: 0 } }).sort({ count: -1 }).limit(100).toArray(),
+      analyticsCounters.find({ kind: 'error_item', count: { $gt: 0 } }).sort({ count: -1, updated_at: -1 }).limit(50).toArray(),
+      analyticsEvents.find({}).sort({ created_at: -1 }).limit(200).toArray(),
       users.find({}, { projection: { password_hash: 0, verify_token_hash: 0, reset_token_hash: 0 } }).sort({ created_at: -1 }).toArray(),
       subscriptions.find({}).toArray(),
-      payments.find({}).sort({ created_at: -1 }).limit(300).toArray(),
+      payments.find({}).sort({ created_at: -1 }).limit(500).toArray(),
       userRequests.find({}).sort({ created_at: -1 }).limit(200).toArray(),
       adminMessages.find({}).sort({ created_at: -1 }).limit(100).toArray(),
-      analyticsEvents.find({ type: 'search' }).sort({ created_at: -1 }).limit(100).toArray(),
+      analyticsEvents.find({ type: 'search' }).sort({ created_at: -1 }).limit(500).toArray(),
       shareReferrals.find({}).sort({ visitors_count: -1, last_visit_at: -1 }).limit(100).toArray(),
-      paywallHitsCol.find({}).sort({ hit_at: -1 }).limit(120).toArray(),
-      visitors.find({ $or: [{ is_pwa: true }, { is_pwa: 'true' }, { pwa_installs: { $gt: 0 } }] }).sort({ last_seen: -1 }).limit(120).toArray()
+      paywallHitsCol.find({}).sort({ hit_at: -1 }).limit(300).toArray(),
+      visitors.find({ $or: [{ is_pwa: true }, { is_pwa: 'true' }, { pwa_installs: { $gt: 0 } }] }).sort({ last_seen: -1 }).limit(1000).toArray()
     ]);
 
     // Merge in-memory liveSessions with DB liveVisitorDocs
@@ -1921,9 +1921,9 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
         totalPaymentsPending,
         totalPaymentsFailed,
         paywallHits: counterPaywallHits,
-        pwaInstalls,
+        pwaInstalls: Math.max(pwaInstalls, (allInstalledVisitors || []).length),
         totalPaywallHits: (allPaywallHits || []).length,
-        totalAppInstalls: (allInstalledVisitors || []).length
+        totalAppInstalls: Math.max(pwaInstalls, (allInstalledVisitors || []).length)
       },
       dailySeries: dailyCounters.slice(0, 14).reverse(),
       breakdown: {
