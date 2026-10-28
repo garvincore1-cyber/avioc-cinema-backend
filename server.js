@@ -1687,10 +1687,13 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
     const activeSessions = Array.from(liveMap.values()).sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
     let watchingMovieCount = 0;
     let watchingTvCount = 0;
+    let downloaderCount = 0;
     let browsingCount = 0;
     for (const s of activeSessions) {
-      if (s.itemType === 'tv' || String(s.activity || '').toLowerCase().includes('live tv')) watchingTvCount++;
-      else if (s.itemType === 'film' || s.itemType === 'series' || String(s.activity || '').toLowerCase().startsWith('watching')) watchingMovieCount++;
+      const act = String(s.activity || '').toLowerCase();
+      if (s.itemType === 'tv' || act.includes('live tv')) watchingTvCount++;
+      else if (act.includes('downloader')) downloaderCount++;
+      else if (s.itemType === 'film' || s.itemType === 'series' || act.startsWith('watching')) watchingMovieCount++;
       else browsingCount++;
     }
 
@@ -1885,6 +1888,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
         onlineCount: activeSessions.length,
         watchingMovieCount,
         watchingTvCount,
+        downloaderCount,
         browsingCount,
         sessions: activeSessions
       },
