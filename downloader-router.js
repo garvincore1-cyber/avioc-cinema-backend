@@ -370,16 +370,19 @@ router.post(['/api/download', '/api/downloader/download'], async (req, res) => {
   const mType = media_type === 'audio' ? 'audio' : 'video';
   const ext = mType === 'audio' ? 'mp3' : 'mp4';
   const cleanTitle = (title || 'download').replace(/[^a-zA-Z0-9_-]/g, '_');
-  const filename = `${cleanTitle}.${ext}`;
+  const ytMatch = String(url).match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([a-zA-Z0-9_-]{11})/);
+  const ytId = ytMatch ? ytMatch[1] : null;
+  const filename = `${cleanTitle}${ytId ? `_[${ytId}]` : ''}.${ext}`;
 
   const task = {
     id: taskId,
     url,
+    youtube_id: ytId,
     title: title || 'Avioc Media Download',
     quality: quality || '720p HD',
     format_id: format_id || '720p',
     media_type: mType,
-    thumbnail: thumbnail || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+    thumbnail: thumbnail || (ytId ? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg` : 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150'),
     uploader: uploader || 'Avioc Downloader',
     progress: 15,
     speed: '14.2 MB/s',
@@ -388,7 +391,7 @@ router.post(['/api/download', '/api/downloader/download'], async (req, res) => {
     created_at: new Date().toISOString(),
     completed_at: null,
     filename,
-    stream_url: `/api/stream/${mType}/${encodeURIComponent(filename)}`
+    stream_url: `/api/stream/${mType}/${encodeURIComponent(filename)}${ytId ? `?id=${ytId}` : ''}`
   };
 
   memoryDownloads.set(taskId, task);
@@ -471,6 +474,16 @@ router.get(['/stream/:media_type/:filename', '/api/stream/:media_type/:filename'
       });
       return fs.createReadStream(localPath).pipe(res);
     }
+  }
+
+  // Fallback: If not on local disk, check if it has YouTube ID or query param for direct cloud conversion
+  const ytMatch = filename.match(/\[([a-zA-Z0-9_-]{11})\]/) || filename.match(/([a-zA-Z0-9_-]{11})\.(mp4|mp3)/);
+  const ytId = req.query.id || (ytMatch ? ytMatch[1] : null);
+  if (ytId) {
+    const directDl = isAudio 
+      ? `https://www.y2mate.com/youtube-mp3/${encodeURIComponent(ytId)}`
+      : `https://ssyoutube.com/watch?v=${encodeURIComponent(ytId)}`;
+    return res.redirect(directDl);
   }
 
   // Fallback: If not on local disk, proxy to engine or stream sample binary MP4/MP3
