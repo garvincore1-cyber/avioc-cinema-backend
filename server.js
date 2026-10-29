@@ -454,9 +454,20 @@ app.post('/api/auth/login', throttle({ limit: 15 }), async (req, res) => {
   const password = String(req.body?.password || '');
   try {
     const user = await users.findOne({ email });
-    if (!user || !verifyPassword(password, user.password_hash)) return fail(res, 401, 'Email or password is incorrect.');
+    if (!user) return fail(res, 401, 'Email or password is incorrect.');
     if (user.removed_by_admin) return fail(res, 403, 'Your account has been removed by an administrator. Please contact support.');
     if (!user.email_verified_at && (process.env.RESEND_API_KEY && process.env.EMAIL_FROM)) return fail(res, 403, 'Verify your email before signing in.');
+
+    if (!user.password_hash) {
+      if (password && password.length >= 6) {
+        const passwordHash = hashPassword(password).encoded;
+        await users.updateOne({ id: user.id }, { $set: { password_hash: passwordHash, updated_at: new Date() } });
+      } else {
+        return fail(res, 400, 'This account was created with Google Sign-In. Enter a password (min 6 chars) to set your password, or use Google.');
+      }
+    } else if (!verifyPassword(password, user.password_hash)) {
+      return fail(res, 401, 'Email or password is incorrect.');
+    }
     const subscription = await subscriptions.findOne({ user_id: user.id });
     users.updateOne({ id: user.id }, { $set: { last_login_at: new Date(), updated_at: new Date() } }).catch(() => {});
     trackRequestVisitor(req, 'Signed In', user);
