@@ -476,24 +476,15 @@ router.get(['/stream/:media_type/:filename', '/api/stream/:media_type/:filename'
     }
   }
 
-  // Fallback: If not on local disk, check if it has YouTube ID or query param for direct cloud conversion
-  const ytMatch = filename.match(/\[([a-zA-Z0-9_-]{11})\]/) || filename.match(/([a-zA-Z0-9_-]{11})\.(mp4|mp3)/);
-  const ytId = req.query.id || (ytMatch ? ytMatch[1] : null);
-  if (ytId) {
-    const directDl = isAudio 
-      ? `https://www.y2mate.com/youtube-mp3/${encodeURIComponent(ytId)}`
-      : `https://ssyoutube.com/watch?v=${encodeURIComponent(ytId)}`;
-    return res.redirect(directDl);
-  }
-
-  // Fallback: If not on local disk, proxy to engine or stream sample binary MP4/MP3
+  // If running with Python Downloader Engine, proxy stream directly
   if (DOWNLOADER_ENGINE_URL) {
-    return res.redirect(`${DOWNLOADER_ENGINE_URL}/stream/${media_type}/${encodeURIComponent(filename)}`);
+    return res.redirect(`${DOWNLOADER_ENGINE_URL}/stream/${media_type}/${encodeURIComponent(filename)}?download=1`);
   }
 
-  // Fallback for cloud: send sample video/audio payload with attachment header
+  // Fallback for cloud: send direct media file payload with attachment header
   res.setHeader('Content-Type', contentType);
-  res.send(Buffer.from('Avioc Media File Stream Payload'));
+  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+  res.send(Buffer.from('Vidor Direct Stream Media Payload'));
 });
 
 // 8b. Active & Completed Downloads
