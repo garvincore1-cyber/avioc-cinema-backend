@@ -425,8 +425,11 @@ router.post(['/api/download', '/api/downloader/download'], async (req, res) => {
 });
 
 // 8. Stream or Download Media File (Supports HTTP 206 Range + direct browser file download)
-router.get(['/stream/:media_type/:filename', '/api/stream/:media_type/:filename'], async (req, res) => {
-  const { media_type, filename } = req.params;
+router.get(['/stream/:media_type/:filename', '/api/stream/:media_type/:filename', '/api/downloader/stream', '/api/downloader/download/stream'], async (req, res) => {
+  const media_type = req.params.media_type || req.query.type || 'video';
+  const rawTitle = req.query.title || req.query.ytId || 'download';
+  const ext = media_type === 'audio' ? 'mp3' : 'mp4';
+  const filename = req.params.filename || `${rawTitle.replace(/[^a-zA-Z0-9_\-\. ]/g, '_')}.${ext}`;
   const isAudio = media_type === 'audio' || filename.endsWith('.mp3') || filename.endsWith('.m4a');
   const contentType = isAudio ? 'audio/mpeg' : 'video/mp4';
 
